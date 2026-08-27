@@ -1,0 +1,976 @@
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+import { Transform } from 'node:stream';
+import { Telegraf, Markup } from 'telegraf';
+import { config } from './config.js';
+import { resolveUrl } from './resolver.js';
+import { checkEzDriveConnection, uploadFileViaEz } from './ezApiClient.js';
+import { safeFetch, filenameFromUrl } from './upload.js';
+import { downloadHttpSource, copyLocalTelegramFile } from './mirrorDownload.js';
+import { probeMedia, prepareMkv } from './mediaPrep.js';
+import { preflightTorrent, downloadTorrent } from './torrentWorker.js';
+
+const token = process.env.MIRROR_TELEGRAM_BOT_TOKEN || config.telegramToken;
+if (!token) throw new Error('Missing TELEGRAM_BOT_TOKEN');
+
+export const mirrorBot = new Telegraf(token, {
+  telegram: { apiRoot: config.telegramApiRoot },
+  handlerTimeout: 6 * 60 * 60 * 1000
+});
+
+const sessions = new Map();
+let nextId = 1;
+
+const VIDEO_EXTS = new Set(['.mkv', '.mp4', '.webm', '.avi', '.mov', '.m4v', '.ts']);
+
+function newSession(ctx, extra = {}) {
+  const id = String(nextId++);
+  const session = {
+    id,
+    userId: String(ctx.from.id),
+    chatId: ctx.chat.id,
+    createdAt: Date.now(),
+    abort: new AbortController(),
+    ...extra
+  };
+  sessions.set(id, session);
+  return session;
+}
+
+function getSession(id, userId) {
+  const s = sessions.get(String(id));
+  if (!s || s.userId !== String(userId)) return null;
+  return s;
+}
+
+function humanBytes(n) {
+  if (!Number.isFinite(n)) return 'unknown';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = n;
+  let i = 0;
+  while (value >= 1024 && i < units.length - 1) {
+    value /= 1024;
+    i++;
+  }
+  return `${value >= 10 || i === 0 ? value.toFixed(1) : value.toFixed(2)} ${units[i]}`;
+}
+
+function humanDuration(sec) {
+  if (!Number.isFinite(sec) || sec < 0) return 'calculating...';
+  sec = Math.round(sec);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+function cancelKeyboard(id) {
+  return Markup.inlineKeyboard([[Markup.button.callback('🛑 Cancel', `mt-cancel:${id}`)]]);
+}
+
+async function setStatus(session, text, keyboard = cancelKeyboard(session.id)) {
+  if (!session.statusMessageId) {
+    const sent = await mirrorBot.telegram.sendMessage(session.chatId, text, keyboard);
+    session.statusMessageId = sent.message_id;
+    session.lastStatusText = text;
+    return;
+  }
+  session.lastStatusText = text;
+  await mirrorBot.telegram.editMessageText(
+    session.chatId,
+    session.statusMessageId,
+    undefined,
+    text,
+    keyboard
+  ).catch(() => {});
+}
+
+async function ensureDrive(userId) {
+  const connected = await checkEzDriveConnection(userId);
+  if (!connected) {
+    throw new Error('Google Drive is not connected. Tap Open Drive Uploader and connect it first.');
+  }
+}
+
+function workDir(session) {
+  return path.join(os.tmpdir(), 'ez-mirror-torrent', `job-${session.id}-${Date.now()}`);
+}
+
+async function collectCleanupFiles(dir) {
+  const files = [];
+  async function walk(current) {
+    let entries;
+    try {
+      entries = await fsp.readdir(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+      } else {
+        try {
+          const stat = await fsp.stat(full);
+          files.push({ path: full, size: stat.size });
+        } catch {}
+      }
+    }
+  }
+  await walk(dir);
+  return files;
+}
+
+async function cleanup(session, { finalText = null, quiet = false } = {}) {
+  const started = Date.now();
+  let freedBytes = 0;
+  let totalBytes = 0;
+  let files = [];
+
+  if (session.workDir) {
+    files = await collectCleanupFiles(session.workDir);
+    totalBytes = files.reduce((sum, file) => sum + file.size, 0);
+
+    if (!quiet) {
+      await setStatus(
+        session,
+        `🧹 Cleaning temporary files\n\nFiles: ${files.length}\nTotal: ${humanBytes(totalBytes)}\n\nProgress: 0%\nFreed: 0 B\nElapsed: 0s`,
+        Markup.inlineKeyboard([])
+      );
+    }
+
+    let lastUpdate = 0;
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      await fsp.unlink(file.path).catch(() => {});
+      freedBytes += file.size;
+      const now = Date.now();
+
+      if (!quiet && (now - lastUpdate >= 500 || i === files.length - 1)) {
+        lastUpdate = now;
+        const percent = totalBytes > 0 ? Math.min(100, Math.floor(freedBytes * 100 / totalBytes)) : 100;
+        await setStatus(
+          session,
+          `🧹 Cleaning temporary files\n\nFiles: ${i + 1} / ${files.length}\nProgress: ${percent}%\nFreed: ${humanBytes(freedBytes)} / ${humanBytes(totalBytes)}\nElapsed: ${humanDuration((now - started) / 1000)}`,
+          Markup.inlineKeyboard([])
+        );
+      }
+    }
+
+    await fsp.rm(session.workDir, { recursive: true, force: true }).catch(() => {});
+  }
+
+  sessions.delete(session.id);
+
+  if (!quiet && finalText) {
+    await setStatus(
+      session,
+      `${finalText}\n\n🧹 Temporary files removed\nFreed: ${humanBytes(freedBytes)}\nElapsed: ${humanDuration((Date.now() - started) / 1000)}`,
+      Markup.inlineKeyboard([])
+    );
+  }
+
+  return { freedBytes, totalBytes, files: files.length };
+}
+
+
+const DISK_RESERVE_BYTES = Number(process.env.CRZ_DISK_RESERVE_BYTES || 1024 * 1024 * 1024);
+
+async function getFreeDiskBytes(target = os.tmpdir()) {
+  const stat = await fsp.statfs(target);
+  return Number(stat.bavail) * Number(stat.bsize);
+}
+
+async function ensureServerSpace(expectedBytes, multiplier = 1, target = os.tmpdir()) {
+  if (!Number.isFinite(expectedBytes) || expectedBytes <= 0) return;
+  const available = await getFreeDiskBytes(target);
+  const required = Math.ceil(expectedBytes * multiplier + DISK_RESERVE_BYTES);
+  if (available < required) {
+    const error = new Error('Server temporary storage is too low');
+    error.code = 'SERVER_STORAGE_LOW';
+    error.requiredBytes = required;
+    error.availableBytes = available;
+    throw error;
+  }
+}
+
+function friendlyError(error) {
+  const code = String(error?.code || '');
+  const raw = `${code} ${String(error?.message || '')}`.toLowerCase();
+
+  if (error?.name === 'AbortError') {
+    return { code: 'CANCELLED', title: 'Cancelled', text: 'The current operation was cancelled.' };
+  }
+  if (code === 'SERVER_STORAGE_LOW' || raw.includes('enospc') || raw.includes('no space left')) {
+    return {
+      code: 'SERVER_STORAGE_LOW',
+      title: 'Server storage is too low',
+      text: error?.requiredBytes
+        ? `CRZ does not have enough temporary disk space.\n\nRequired: ~${humanBytes(error.requiredBytes)}\nAvailable: ${humanBytes(error.availableBytes)}\n\nFree some server storage and retry.`
+        : 'CRZ ran out of temporary server storage. Free some space and retry.'
+    };
+  }
+  if (code === 'DRIVE_AUTH_EXPIRED' || raw.includes('invalid_grant') || raw.includes('authorization expired') || raw.includes('token expired') || raw.includes('revoked')) {
+    return {
+      code: 'DRIVE_AUTH_EXPIRED',
+      title: 'Google Drive login expired',
+      text: 'Your Google Drive authorization is no longer valid.\n\nReconnect Google Drive, then tap Retry Upload.\n\nYour processed file is still safe on CRZ.',
+      reconnect: true
+    };
+  }
+  if (code === 'DRIVE_NOT_CONNECTED' || raw.includes('drive is not connected') || raw.includes('connect google drive')) {
+    return {
+      code: 'DRIVE_NOT_CONNECTED',
+      title: 'Google Drive is not connected',
+      text: 'Connect Google Drive, then tap Retry Upload.\n\nYour processed file is still safe on CRZ.',
+      reconnect: true
+    };
+  }
+  if (code === 'DRIVE_STORAGE_FULL' || raw.includes('storagequotaexceeded') || raw.includes('storage quota') || raw.includes('insufficient storage')) {
+    return {
+      code: 'DRIVE_STORAGE_FULL',
+      title: 'Google Drive storage is full',
+      text: 'Google Drive reported a storage/quota problem.\n\nFree Drive storage, then tap Retry Upload.\n\nYour processed file is still safe on CRZ.'
+    };
+  }
+  if (code === 'DRIVE_RATE_LIMIT' || raw.includes('rate limit') || raw.includes('ratelimit') || raw.includes('too many requests')) {
+    return {
+      code: 'DRIVE_RATE_LIMIT',
+      title: 'Google Drive is temporarily rate-limited',
+      text: 'Google is temporarily limiting uploads. Wait a little and tap Retry Upload.\n\nYour processed file is still safe on CRZ.'
+    };
+  }
+  if (code === 'DRIVE_PERMISSION' || raw.includes('insufficient permission') || raw.includes('permission denied')) {
+    return {
+      code: 'DRIVE_PERMISSION',
+      title: 'Google Drive permission problem',
+      text: 'Google rejected the upload because the Drive authorization no longer has the required permission.\n\nReconnect Google Drive and retry.',
+      reconnect: true
+    };
+  }
+  if (code === 'NETWORK_ERROR' || raw.includes('econnreset') || raw.includes('etimedout') || raw.includes('enotfound') || raw.includes('eai_again') || raw.includes('fetch failed') || raw.includes('socket')) {
+    return {
+      code: 'NETWORK_ERROR',
+      title: 'Temporary network problem',
+      text: 'The current transfer was interrupted by a temporary network/server problem.\n\nThe local file is preserved. Retry the current stage.'
+    };
+  }
+  if (raw.includes('file is too big')) {
+    return {
+      code: 'TELEGRAM_FILE_TOO_BIG',
+      title: 'Telegram file transfer failed',
+      text: 'Telegram refused this file size through the current Bot API connection.\n\nLarge files require CRZ to use its local Telegram Bot API server.'
+    };
+  }
+  if (raw.includes('ffmpeg') || raw.includes('invalid data found') || raw.includes('could not find codec') || raw.includes('corrupt')) {
+    return {
+      code: 'MEDIA_PROCESSING_ERROR',
+      title: 'MKV processing failed',
+      text: 'FFmpeg could not process this media cleanly. The downloaded source is preserved so you can retry processing.'
+    };
+  }
+  return {
+    code: code || 'UNKNOWN_ERROR',
+    title: 'Operation failed',
+    text: 'CRZ could not complete the current stage. The local job is preserved where possible so you can retry.'
+  };
+}
+
+function readyKeyboard(session) {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('⬇️ Download', `mt-ready-download:${session.id}`),
+      Markup.button.callback('☁️ Upload to Drive', `mt-ready-upload:${session.id}`)
+    ],
+    [Markup.button.callback('🗑 Delete', `mt-ready-delete:${session.id}`)]
+  ]);
+}
+
+function retryKeyboard(session, info, stage) {
+  const rows = [];
+  if (info.reconnect) rows.push([Markup.button.webApp('☁️ Reconnect Google Drive', config.webappUrl)]);
+  if (stage === 'upload') {
+    rows.push([Markup.button.callback('🔁 Retry Upload', `mt-retry-upload:${session.id}`)]);
+    if (session.readyFilePath) rows.push([Markup.button.callback('⬇️ Download Instead', `mt-ready-download:${session.id}`)]);
+  } else if (stage === 'process') {
+    rows.push([Markup.button.callback('🔁 Retry Processing', `mt-retry-process:${session.id}`)]);
+  } else if (stage === 'copy') {
+    rows.push([Markup.button.callback('🔁 Retry Local Copy', `mt-retry-copy:${session.id}`)]);
+  } else if (stage === 'torrent') {
+    rows.push([Markup.button.callback('🔁 Retry Torrent', `mt-retry-torrent:${session.id}`)]);
+  }
+  rows.push([Markup.button.callback('🗑 Cancel & Clean', `mt-cancel:${session.id}`)]);
+  return Markup.inlineKeyboard(rows);
+}
+
+async function showRecoverableError(session, error, stage) {
+  const info = friendlyError(error);
+  if (info.code === 'CANCELLED') return cleanup(session, { finalText: '🛑 Cancelled' });
+  await setStatus(session, `❌ ${info.title}\n\n${info.text}`, retryKeyboard(session, info, stage));
+}
+
+function telegramSendProgress({ totalBytes, onProgress }) {
+  let done = 0;
+  let last = 0;
+  const started = Date.now();
+  return new Transform({
+    transform(chunk, _encoding, callback) {
+      done += chunk.length;
+      const now = Date.now();
+      if (now - last >= 2000 || done >= totalBytes) {
+        last = now;
+        const elapsed = Math.max(0.001, (now - started) / 1000);
+        const speed = done / elapsed;
+        onProgress?.({
+          doneBytes: done,
+          totalBytes,
+          percent: totalBytes > 0 ? Math.min(100, Math.floor(done * 100 / totalBytes)) : 100,
+          speed,
+          elapsedSeconds: elapsed,
+          etaSeconds: speed > 0 ? Math.max(0, Math.round((totalBytes - done) / speed)) : null
+        });
+      }
+      callback(null, chunk);
+    }
+  });
+}
+
+async function showPreparedChoices(session) {
+  await setStatus(
+    session,
+    `✅ MKV Prepared\n\n${session.readyFilename}\nSize: ${humanBytes(session.readySize)}\nAudio: ${session.selectedAudio.language} ${session.readyOutputCodec.toUpperCase()}\nVideo: copied\nSubtitle: ${session.keepEnglishSubtitle && session.media.englishSubtitle ? 'English' : 'None'}\n\nWhat do you want to do?`,
+    readyKeyboard(session)
+  );
+}
+
+async function uploadReadyFile(session) {
+  try {
+    if (!session.readyFilePath) throw new Error('Prepared file is no longer available');
+    await ensureDrive(session.userId);
+    await uploadPrepared(session, session.readyFilePath, session.readyFilename, session.readyMimeType || 'video/x-matroska');
+    await cleanup(session, {
+      finalText: `✅ Uploaded to Google Drive\n\n${session.readyFilename}\nSize: ${humanBytes(session.readySize)}\nDrive: uploaded`
+    });
+  } catch (error) {
+    if (error?.name === 'AbortError') return;
+    await showRecoverableError(session, error, 'upload');
+  }
+}
+
+async function downloadReadyFile(session) {
+  try {
+    if (!session.readyFilePath) throw new Error('Prepared file is no longer available');
+    const stat = await fsp.stat(session.readyFilePath);
+    const source = fs.createReadStream(session.readyFilePath);
+    const progress = telegramSendProgress({
+      totalBytes: stat.size,
+      onProgress: p => {
+        void setStatus(
+          session,
+          `⬇️ Sending processed MKV to Telegram\n\n${session.readyFilename}\n\nProgress: ${p.percent}%\nSent: ${humanBytes(p.doneBytes)} / ${humanBytes(p.totalBytes)}\nSpeed: ${humanBytes(p.speed)}/s\nElapsed: ${humanDuration(p.elapsedSeconds)}\nETA: ${humanDuration(p.etaSeconds)}`,
+          cancelKeyboard(session.id)
+        );
+      }
+    });
+    source.pipe(progress);
+    await mirrorBot.telegram.sendDocument(session.chatId, { source: progress, filename: session.readyFilename });
+    await cleanup(session, { finalText: `✅ Sent to Telegram\n\n${session.readyFilename}\nSize: ${humanBytes(stat.size)}` });
+  } catch (error) {
+    if (error?.name === 'AbortError') return;
+    await showRecoverableError(session, error, 'download');
+  }
+}
+
+async function uploadPrepared(session, filePath, filename, mimeType = 'video/x-matroska') {
+  const stat = await fsp.stat(filePath);
+
+  await setStatus(session,
+    `☁️ Uploading to Google Drive\n\n${filename}\n\nProgress: 0%\nSent: 0 B / ${humanBytes(stat.size)}\nSpeed: calculating...\nETA: calculating...\n\nRoute: CRZ → EZ → Google Drive`
+  );
+
+  return uploadFileViaEz({
+    telegramId: session.userId,
+    filePath,
+    filename,
+    mimeType,
+    signal: session.abort.signal,
+    onProgress: p => {
+      void setStatus(session,
+        `☁️ Uploading to Google Drive\n\n${filename}\n\nProgress: ${p.percent}%\nSent: ${humanBytes(p.sentBytes)} / ${humanBytes(p.totalBytes)}\nSpeed: ${humanBytes(p.speed)}/s\nElapsed: ${humanDuration(p.elapsedSeconds)}\nETA: ${humanDuration(p.etaSeconds)}\n\nRoute: CRZ → EZ → Google Drive`
+      );
+    }
+  });
+}
+
+async function processDownloadedFile(session, filePath, filename) {
+  const ext = path.extname(filename).toLowerCase();
+
+  if (ext !== '.mkv') {
+    await setStatus(session, `✅ Download Complete\n\n${filename}\n\nNot an MKV. Uploading original file to Drive...`);
+    await uploadPrepared(session, filePath, filename, 'application/octet-stream');
+    await setStatus(session, `✅ Complete\n\n${filename}\n\nUploaded to Google Drive.`, Markup.inlineKeyboard([]));
+    return cleanup(session);
+  }
+
+  await setStatus(session, `🔎 Analyzing MKV\n\n${filename}\n\nReading video, audio and subtitle tracks...`);
+  const media = await probeMedia(filePath);
+  if (!media.audio.length) throw new Error('No audio streams found in this MKV');
+
+  session.inputPath = filePath;
+  session.filename = filename;
+  session.media = media;
+
+  if (media.audio.length === 1) {
+    session.selectedAudio = media.audio[0];
+    await setStatus(
+      session,
+      `🎧 Audio Track\n\n${filename}\n\nOnly one audio track was found:\n${media.audio[0].language} · ${media.audio[0].codec.toUpperCase()}${media.audio[0].channels ? ` · ${media.audio[0].channels}ch` : ''}\n\nUsing this track automatically...`
+    );
+    return askSubtitle(session);
+  }
+
+  // With 2+ audio tracks, NEVER auto-select a track.
+  // English may be marked as recommended, but the user must tap a button.
+  session.selectedAudio = null;
+
+  const shownAudio = media.audio.slice(0, 12);
+  const isEnglishAudio = a =>
+    String(a.language || '').trim().toLowerCase() === 'english';
+
+  const rows = shownAudio.map((a, i) => [
+    Markup.button.callback(
+      `${isEnglishAudio(a) ? '⭐ ' : ''}${a.language} · ${a.codec.toUpperCase()}${a.channels ? ` · ${a.channels}ch` : ''}`,
+      `mt-audio:${session.id}:${i}`
+    )
+  ]);
+  rows.push([Markup.button.callback('🛑 Cancel', `mt-cancel:${session.id}`)]);
+
+  const summary = shownAudio.map((a, i) =>
+    `${i + 1}. ${isEnglishAudio(a) ? '⭐ ' : ''}${a.language} · ${a.codec.toUpperCase()}${a.channels ? ` · ${a.channels}ch` : ''}${a.supported ? ' ✅' : ' → conversion'}`
+  ).join('\n');
+
+  await setStatus(
+    session,
+    `🎧 Choose Audio\n\n${filename}\n\n${summary}\n\n⭐ = English recommended\nNo audio track is selected automatically.`,
+    Markup.inlineKeyboard(rows)
+  );
+}
+
+async function askSubtitle(session) {
+  const a = session.selectedAudio;
+  const trackNotice = session.media?.audio?.length === 1
+    ? 'ℹ️ Only 1 audio track found in this MKV.\nUsing it automatically.\n\n'
+    : '';
+  const conversion = a.supported
+    ? `${a.codec.toUpperCase()} is supported → audio will be copied`
+    : `${a.codec.toUpperCase()} is unsupported → audio-only conversion required`;
+
+  if (!session.media.englishSubtitle) {
+    session.keepEnglishSubtitle = false;
+    await setStatus(session,
+      `🎧 Audio Selected: ${a.language}\n\n${trackNotice}${conversion}\n\nEnglish subtitle: not found\n\nStarting MKV preparation...`
+    );
+    return runMediaPrep(session);
+  }
+
+  await setStatus(session,
+    `🎧 Audio Selected: ${a.language}\nCodec: ${a.codec.toUpperCase()}${a.channels ? ` · ${a.channels}ch` : ''}\n\n${trackNotice}${conversion}\n\nKeep English subtitle?`,
+    Markup.inlineKeyboard([
+      [
+        Markup.button.callback('✅ Yes', `mt-sub:${session.id}:yes`),
+        Markup.button.callback('❌ No', `mt-sub:${session.id}:no`)
+      ],
+      [Markup.button.callback('🛑 Cancel', `mt-cancel:${session.id}`)]
+    ])
+  );
+}
+
+async function runMediaPrep(session) {
+  const base = path.basename(session.filename, path.extname(session.filename));
+  const lang = session.selectedAudio.language || 'Audio';
+  const outputPath = path.join(session.workDir, `${base} [${lang}].mkv`);
+  const started = Date.now();
+
+  try {
+    const inputStat = await fsp.stat(session.inputPath);
+    await ensureServerSpace(inputStat.size, 1.15, session.workDir || os.tmpdir());
+  } catch (error) {
+    return showRecoverableError(session, error, 'process');
+  }
+
+  await setStatus(session,
+    `🔧 Preparing MKV\n\nAudio: ${lang}\n${session.selectedAudio.codec.toUpperCase()} → ${session.selectedAudio.supported ? 'COPY' : String(process.env.MIRROR_AUDIO_TARGET || 'AAC').toUpperCase()}\nVideo: COPY\n\nProgress: starting...`
+  );
+
+  const result = await prepareMkv({
+    inputPath: session.inputPath,
+    outputPath,
+    audioStream: session.selectedAudio,
+    englishSubtitle: session.media.englishSubtitle,
+    keepEnglishSubtitle: session.keepEnglishSubtitle,
+    durationSeconds: session.media.durationSeconds,
+    signal: session.abort.signal,
+    onProgress: p => {
+      const elapsed = (Date.now() - started) / 1000;
+      void setStatus(session,
+        `🔧 Preparing MKV\n\nAudio: ${lang}\n${p.inputCodec.toUpperCase()} → ${p.converting ? p.outputCodec.toUpperCase() : 'COPY'}\nVideo: COPY\n\nProgress: ${p.percent ?? '?'}%\nSpeed: ${p.speed ? `${p.speed.toFixed(2)}x` : 'calculating...'}\nProcessed: ${humanDuration(p.processedSeconds)} / ${humanDuration(session.media.durationSeconds)}\nElapsed: ${humanDuration(elapsed)}\nETA: ${humanDuration(p.etaSeconds)}`
+      );
+    }
+  });
+
+  const finalName = path.basename(result.outputPath);
+  session.readyFilePath = result.outputPath;
+  session.readyFilename = finalName;
+  session.readyMimeType = 'video/x-matroska';
+  session.readySize = result.size;
+  session.readyOutputCodec = result.outputCodec;
+
+  await showPreparedChoices(session);
+}
+
+async function beginTorrentPreflight(ctx, source) {
+  const session = newSession(ctx, { source, kind: 'torrent' });
+  session.workDir = workDir(session);
+  await fsp.mkdir(session.workDir, { recursive: true });
+
+  await setStatus(session,
+    `🧲 Torrent Check\n\nFetching metadata and checking swarm health...\n\nThis does not start the full movie download.`
+  );
+
+
+  const result = await preflightTorrent(source, session.workDir, {
+    signal: session.abort.signal,
+    onEvent: event => {
+      if (event.type === 'metadata') {
+        void setStatus(session,
+          `🧲 Torrent Check\n\nFetching metadata...\nElapsed: ${humanDuration(event.elapsed)}\nPeers seen: ${event.peers}\nSeeds seen: ${event.seeds}`
+        );
+      } else if (event.type === 'health') {
+        void setStatus(session,
+          `🧲 Torrent Check\n\nMetadata received ✅\nChecking swarm...\n\nHealth: ${event.health}\nSeeds seen: ${event.seeds}\nPeers seen: ${event.peers}\nTrackers: ${event.trackers}\nElapsed: ${humanDuration(event.elapsed)}`
+        );
+      }
+    }
+  });
+
+  session.torrentInfo = result;
+  const videoFiles = result.files
+    .filter(f => VIDEO_EXTS.has(path.extname(f.name).toLowerCase()))
+    .sort((a, b) => b.size - a.size)
+    .slice(0, 8);
+
+  if (!videoFiles.length) throw new Error('No supported video files found in this torrent');
+
+  const rows = videoFiles.map(f => [
+    Markup.button.callback(
+      `▶️ ${f.name.slice(0, 42)} · ${humanBytes(f.size)}`,
+      `mt-tfile:${session.id}:${f.index}`
+    )
+  ]);
+  rows.push([Markup.button.callback('🛑 Cancel / Try Another', `mt-cancel:${session.id}`)]);
+
+  await setStatus(session,
+    `🧲 Torrent Ready\n\n${result.name || 'Torrent'}\n\nHealth: ${result.health}\nSeeds seen: ${result.seeds}\nPeers seen: ${result.peers}\nTrackers: ${result.trackers}\n\nChoose the movie to download.\nIf health looks poor, cancel and send another torrent.`,
+    Markup.inlineKeyboard(rows)
+  );
+}
+
+async function runTorrentDownload(session, fileIndex) {
+  session.selectedTorrentFileIndex = Number(fileIndex);
+  const selectedTorrentFile = session.torrentInfo?.files?.find(f => Number(f.index) === Number(fileIndex));
+
+  if (selectedTorrentFile?.size) {
+    try {
+      await ensureServerSpace(Number(selectedTorrentFile.size), 2.15, session.workDir || os.tmpdir());
+    } catch (error) {
+      return showRecoverableError(session, error, 'torrent');
+    }
+  }
+
+  await setStatus(session, `🧲 Starting Torrent\n\nConnecting to peers and measuring real download speed...`);
+
+  const result = await downloadTorrent(session.source, session.workDir, fileIndex, {
+    signal: session.abort.signal,
+    onEvent: event => {
+      if (event.type === 'metadata') {
+        void setStatus(session,
+          `🧲 Starting Torrent\n\nFetching metadata...\nPeers: ${event.peers}\nSeeds: ${event.seeds}\nElapsed: ${humanDuration(event.elapsed)}`
+        );
+      } else if (event.type === 'progress') {
+        const warning = event.elapsed >= 20 && event.speed < 512 * 1024
+          ? '\n\n⚠️ Torrent is currently slow. You can cancel and try another.'
+          : '';
+        void setStatus(session,
+          `🧲 Torrent Download\n\nProgress: ${event.percent}%\nDownloaded: ${humanBytes(event.done)} / ${humanBytes(event.total)}\nSpeed: ${humanBytes(event.speed)}/s\nSeeds: ${event.seeds}\nPeers: ${event.peers}\nElapsed: ${humanDuration(event.elapsed)}\nETA: ${humanDuration(event.eta)}${warning}`
+        );
+      }
+    }
+  });
+
+  await setStatus(session,
+    `✅ Torrent Download Complete\n\n${result.filename}\nSize: ${humanBytes(result.size)}\n\nAnalyzing file...`
+  );
+  return processDownloadedFile(session, result.file_path, result.filename);
+}
+
+async function beginResolvedSource(ctx, source) {
+  const session = newSession(ctx, { source, kind: 'http' });
+  session.workDir = workDir(session);
+
+  await setStatus(session,
+    `🔗 Source Ready\n\n${source.filename || filenameFromUrl(source.url)}\nMethod: ${source.method || 'direct'}\n\nStarting download...`
+  );
+
+  const started = Date.now();
+  const result = await downloadHttpSource(source, session.workDir, {
+    signal: session.abort.signal,
+    onProgress: p => {
+      const elapsed = (Date.now() - started) / 1000;
+      void setStatus(session,
+        `⬇️ Downloading Source\n\n${source.filename || filenameFromUrl(source.url)}\n\nProgress: ${p.percent ?? '?'}%\nDownloaded: ${humanBytes(p.doneBytes)}${p.totalBytes ? ` / ${humanBytes(p.totalBytes)}` : ''}\nSpeed: ${humanBytes(p.speed)}/s\nElapsed: ${humanDuration(elapsed)}\nETA: ${humanDuration(p.etaSeconds)}`
+      );
+    }
+  });
+
+  return processDownloadedFile(session, result.filePath, result.filename);
+}
+
+async function handleUrl(ctx, rawUrl) {
+  const waiting = await ctx.reply('🔎 Resolving link...\n\nChecking for a downloadable source.');
+  let resolved;
+  try {
+    resolved = await resolveUrl(rawUrl);
+  } catch (error) {
+    return ctx.telegram.editMessageText(ctx.chat.id, waiting.message_id, undefined,
+      `❌ Could not resolve link\n\n${error.message}`);
+  }
+
+  if (resolved.kind === 'choices') {
+    const session = newSession(ctx, { kind: 'choice', choices: resolved.choices });
+    session.statusMessageId = waiting.message_id;
+    const rows = resolved.choices.slice(0, 8).map((choice, i) => [
+      Markup.button.callback(
+        String(choice.label || choice.name || filenameFromUrl(choice.url) || `Source ${i + 1}`).slice(0, 48),
+        `mt-source:${session.id}:${i}`
+      )
+    ]);
+    rows.push([Markup.button.callback('🛑 Cancel', `mt-cancel:${session.id}`)]);
+    await setStatus(session, '🔗 Multiple Sources Found\n\nChoose the download source:', Markup.inlineKeyboard(rows));
+    return;
+  }
+
+  await ctx.telegram.deleteMessage(ctx.chat.id, waiting.message_id).catch(() => {});
+  return beginResolvedSource(ctx, resolved);
+}
+
+async function runTelegramMkvCopy(session) {
+  const doc = session.telegramDoc;
+  const filename = session.filename;
+  const started = Date.now();
+
+  try {
+    if (doc.file_size) {
+      await ensureServerSpace(Number(doc.file_size), 2.15, session.workDir || os.tmpdir());
+    }
+
+    await setStatus(
+      session,
+      `⬇️ Local Copy\n\n${filename}\nSize: ${humanBytes(doc.file_size)}\n\nProgress: 0%\nCopied: 0 B${doc.file_size ? ` / ${humanBytes(doc.file_size)}` : ''}\nSpeed: calculating...\nElapsed: 0s\nETA: calculating...`
+    );
+
+    const tgFile = await mirrorBot.telegram.getFile(doc.file_id);
+    let result;
+
+    if (tgFile.file_path && path.isAbsolute(tgFile.file_path)) {
+      result = await copyLocalTelegramFile(tgFile.file_path, session.workDir, filename, {
+        signal: session.abort.signal,
+        onProgress: p => void setStatus(
+          session,
+          `⬇️ Local Copy\n\n${filename}\n\nProgress: ${p.percent ?? '?'}%\nCopied: ${humanBytes(p.doneBytes)} / ${humanBytes(p.totalBytes)}\nSpeed: ${humanBytes(p.speed)}/s\nElapsed: ${humanDuration((Date.now() - started) / 1000)}\nETA: ${humanDuration(p.etaSeconds)}`
+        )
+      });
+    } else {
+      const url = `${config.telegramApiRoot}/file/bot${token}/${tgFile.file_path}`;
+      result = await downloadHttpSource(
+        { url, filename, headers: {}, mimeType: doc.mime_type || 'video/x-matroska' },
+        session.workDir,
+        {
+          signal: session.abort.signal,
+          onProgress: p => void setStatus(
+            session,
+            `⬇️ Local Copy\n\n${filename}\n\nProgress: ${p.percent ?? '?'}%\nCopied: ${humanBytes(p.doneBytes)}${p.totalBytes ? ` / ${humanBytes(p.totalBytes)}` : ''}\nSpeed: ${humanBytes(p.speed)}/s\nElapsed: ${humanDuration((Date.now() - started) / 1000)}\nETA: ${humanDuration(p.etaSeconds)}`
+          )
+        }
+      );
+    }
+
+    await setStatus(
+      session,
+      `✅ Local Copy Complete\n\n${filename}\nSize: ${humanBytes(result.totalBytes)}\nElapsed: ${humanDuration((Date.now() - started) / 1000)}\n\nAnalyzing MKV...`
+    );
+
+    return processDownloadedFile(session, result.filePath, filename);
+  } catch (error) {
+    if (error?.name === 'AbortError') return;
+    await showRecoverableError(session, error, 'copy');
+  }
+}
+
+async function handleTelegramDocument(ctx, doc) {
+  const filename = doc.file_name || `telegram-${Date.now()}`;
+  const ext = path.extname(filename).toLowerCase();
+
+  if (ext === '.torrent') {
+    const session = newSession(ctx, { kind: 'torrent-upload' });
+    session.workDir = workDir(session);
+    await fsp.mkdir(session.workDir, { recursive: true });
+    await setStatus(session, `📦 Torrent file received\n\n${filename}\n\nPreparing torrent health check...`);
+
+    const tgFile = await ctx.telegram.getFile(doc.file_id);
+    let torrentPath;
+    if (tgFile.file_path && path.isAbsolute(tgFile.file_path)) {
+      torrentPath = path.join(session.workDir, path.basename(filename));
+      await fsp.copyFile(tgFile.file_path, torrentPath);
+    } else {
+      const url = `${config.telegramApiRoot}/file/bot${token}/${tgFile.file_path}`;
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`Telegram file download failed: HTTP ${response.status}`);
+      torrentPath = path.join(session.workDir, path.basename(filename));
+      await fsp.writeFile(torrentPath, Buffer.from(await response.arrayBuffer()));
+    }
+
+    // Reuse the same session id/status message by running preflight directly.
+    session.kind = 'torrent';
+    session.source = { kind: 'torrent', value: torrentPath };
+
+    const result = await preflightTorrent(session.source, session.workDir, {
+      signal: session.abort.signal,
+      onEvent: event => {
+        if (event.type === 'health') {
+          void setStatus(session,
+            `🧲 Torrent Check\n\nHealth: ${event.health}\nSeeds seen: ${event.seeds}\nPeers seen: ${event.peers}\nTrackers: ${event.trackers}\nElapsed: ${humanDuration(event.elapsed)}`
+          );
+        }
+      }
+    });
+    session.torrentInfo = result;
+
+    const videoFiles = result.files
+      .filter(f => VIDEO_EXTS.has(path.extname(f.name).toLowerCase()))
+      .sort((a, b) => b.size - a.size)
+      .slice(0, 8);
+    if (!videoFiles.length) throw new Error('No supported video files found in this torrent');
+
+    const rows = videoFiles.map(f => [
+      Markup.button.callback(
+        `▶️ ${f.name.slice(0, 42)} · ${humanBytes(f.size)}`,
+        `mt-tfile:${session.id}:${f.index}`
+      )
+    ]);
+    rows.push([Markup.button.callback('🛑 Cancel / Try Another', `mt-cancel:${session.id}`)]);
+
+    await setStatus(session,
+      `🧲 Torrent Ready\n\n${result.name || filename}\n\nHealth: ${result.health}\nSeeds seen: ${result.seeds}\nPeers seen: ${result.peers}\nTrackers: ${result.trackers}\n\nChoose the movie to download.`,
+      Markup.inlineKeyboard(rows)
+    );
+    return;
+  }
+
+  if (ext !== '.mkv') {
+    return ctx.reply('For direct Telegram files, send an MKV or a .torrent file.');
+  }
+
+  const session = newSession(ctx, { kind: 'telegram-mkv' });
+  session.workDir = workDir(session);
+  session.filename = filename;
+  session.telegramDoc = {
+    file_id: doc.file_id,
+    file_name: filename,
+    file_size: doc.file_size || null,
+    mime_type: doc.mime_type || 'video/x-matroska'
+  };
+  await fsp.mkdir(session.workDir, { recursive: true });
+
+  return runTelegramMkvCopy(session);
+}
+
+mirrorBot.start(ctx => ctx.reply(
+  'Send me:\n\n🧲 Magnet link\n📦 .torrent file\n🔗 Mirror/direct download link\n🎬 MKV file\n\nI will show progress for download → MKV preparation → Google Drive upload.',
+  Markup.inlineKeyboard([
+    [Markup.button.webApp('☁️ Open Drive Uploader', config.webappUrl)]
+  ])
+));
+
+mirrorBot.command('help', ctx => ctx.reply(
+  'Reliable workflow:\n\n1. Send torrent/magnet/link/MKV\n2. Torrent health is checked first\n3. Choose movie/audio\n4. Unsupported audio is converted for browser playback\n5. Final file uploads to the same Google Drive account\n\n/cancel - cancel your latest active job'
+));
+
+mirrorBot.command('cancel', async ctx => {
+  const active = [...sessions.values()]
+    .filter(s => s.userId === String(ctx.from.id))
+    .sort((a, b) => b.createdAt - a.createdAt)[0];
+  if (!active) return ctx.reply('No active job.');
+  active.abort.abort();
+  await cleanup(active, { finalText: '🛑 Cancelled' });
+});
+
+mirrorBot.on('text', async ctx => {
+  const text = String(ctx.message.text || '').trim();
+  if (!text || text.startsWith('/')) return;
+
+  try {
+    if (text.startsWith('magnet:?')) {
+      return await beginTorrentPreflight(ctx, { kind: 'magnet', value: text });
+    }
+    if (/^https?:\/\//i.test(text)) {
+      return await handleUrl(ctx, text);
+    }
+    await ctx.reply('Send a magnet link, HTTP/HTTPS mirror/direct link, MKV, or .torrent file.');
+  } catch (error) {
+    await ctx.reply(`❌ ${error.message}`);
+  }
+});
+
+mirrorBot.on('document', async ctx => {
+  try {
+    await handleTelegramDocument(ctx, ctx.message.document);
+  } catch (error) {
+    const info = friendlyError(error);
+    await ctx.reply(`❌ ${info.title}\n\n${info.text}`);
+  }
+});
+
+mirrorBot.action(/^mt-cancel:(\d+)$/, async ctx => {
+  await ctx.answerCbQuery('Cancelling...').catch(() => {});
+  const s = getSession(ctx.match[1], ctx.from.id);
+  if (!s) return;
+  s.abort.abort();
+  await cleanup(s, { finalText: '🛑 Cancelled' });
+});
+
+mirrorBot.action(/^mt-tfile:(\d+):(\d+)$/, async ctx => {
+  await ctx.answerCbQuery('Starting download...').catch(() => {});
+  const s = getSession(ctx.match[1], ctx.from.id);
+  if (!s) return;
+  try {
+    await runTorrentDownload(s, Number(ctx.match[2]));
+  } catch (error) {
+    if (error?.name === 'AbortError') return;
+    await showRecoverableError(s, error, 'torrent');
+  }
+});
+
+mirrorBot.action(/^mt-source:(\d+):(\d+)$/, async ctx => {
+  await ctx.answerCbQuery('Source selected').catch(() => {});
+  const s = getSession(ctx.match[1], ctx.from.id);
+  if (!s) return;
+  const choice = s.choices?.[Number(ctx.match[2])];
+  if (!choice?.url) return setStatus(s, '❌ Invalid source selection', undefined);
+
+  try {
+    await cleanup(s);
+    await handleUrl(ctx, choice.url);
+  } catch (error) {
+    await ctx.reply(`❌ ${error.message}`);
+  }
+});
+
+mirrorBot.action(/^mt-audio:(\d+):(\d+)$/, async ctx => {
+  await ctx.answerCbQuery('Audio selected').catch(() => {});
+  const s = getSession(ctx.match[1], ctx.from.id);
+  if (!s) return;
+  const audio = s.media?.audio?.[Number(ctx.match[2])];
+  if (!audio) return;
+  s.selectedAudio = audio;
+  try {
+    await askSubtitle(s);
+  } catch (error) {
+    await showRecoverableError(s, error, 'process');
+  }
+});
+
+mirrorBot.action(/^mt-sub:(\d+):(yes|no)$/, async ctx => {
+  await ctx.answerCbQuery('Starting processing...').catch(() => {});
+  const s = getSession(ctx.match[1], ctx.from.id);
+  if (!s) return;
+  s.keepEnglishSubtitle = ctx.match[2] === 'yes';
+
+  try {
+    await runMediaPrep(s);
+  } catch (error) {
+    if (error?.name === 'AbortError') return;
+    await showRecoverableError(s, error, 'process');
+  }
+});
+
+mirrorBot.action(/^mt-ready-upload:(\d+)$/, async ctx => {
+  await ctx.answerCbQuery('Starting Drive upload...').catch(() => {});
+  const s = getSession(ctx.match[1], ctx.from.id);
+  if (!s) return;
+  s.abort = new AbortController();
+  await uploadReadyFile(s);
+});
+
+mirrorBot.action(/^mt-ready-download:(\d+)$/, async ctx => {
+  await ctx.answerCbQuery('Preparing download...').catch(() => {});
+  const s = getSession(ctx.match[1], ctx.from.id);
+  if (!s) return;
+  s.abort = new AbortController();
+  await downloadReadyFile(s);
+});
+
+mirrorBot.action(/^mt-ready-delete:(\d+)$/, async ctx => {
+  await ctx.answerCbQuery('Deleting...').catch(() => {});
+  const s = getSession(ctx.match[1], ctx.from.id);
+  if (!s) return;
+  await cleanup(s, { finalText: '🗑 Deleted' });
+});
+
+mirrorBot.action(/^mt-retry-upload:(\d+)$/, async ctx => {
+  await ctx.answerCbQuery('Retrying upload...').catch(() => {});
+  const s = getSession(ctx.match[1], ctx.from.id);
+  if (!s) return;
+  s.abort = new AbortController();
+  await uploadReadyFile(s);
+});
+
+mirrorBot.action(/^mt-retry-process:(\d+)$/, async ctx => {
+  await ctx.answerCbQuery('Retrying processing...').catch(() => {});
+  const s = getSession(ctx.match[1], ctx.from.id);
+  if (!s) return;
+  s.abort = new AbortController();
+  try {
+    await runMediaPrep(s);
+  } catch (error) {
+    if (error?.name === 'AbortError') return;
+    await showRecoverableError(s, error, 'process');
+  }
+});
+
+mirrorBot.action(/^mt-retry-copy:(\d+)$/, async ctx => {
+  await ctx.answerCbQuery('Retrying local copy...').catch(() => {});
+  const s = getSession(ctx.match[1], ctx.from.id);
+  if (!s) return;
+  s.abort = new AbortController();
+  await runTelegramMkvCopy(s);
+});
+
+mirrorBot.action(/^mt-retry-torrent:(\d+)$/, async ctx => {
+  await ctx.answerCbQuery('Retrying torrent...').catch(() => {});
+  const s = getSession(ctx.match[1], ctx.from.id);
+  if (!s || s.selectedTorrentFileIndex == null) return;
+  s.abort = new AbortController();
+  await runTorrentDownload(s, s.selectedTorrentFileIndex);
+});
+
+export async function registerMirrorBotCommands() {
+  await mirrorBot.telegram.setMyCommands([
+    { command: 'start', description: 'Open CRZ Bot' },
+    { command: 'help', description: 'Show supported inputs' },
+    { command: 'cancel', description: 'Cancel current job' }
+  ]);
+}

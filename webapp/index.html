@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Drive Uploader</title>
+  <link rel="stylesheet" href="/style.css" />
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+  <main>
+    <h1>Drive Uploader</h1>
+
+    <section class="card">
+      <div class="row"><span>Google Drive</span><strong id="connection">Checking...</strong></div>
+      <button id="connect" hidden>Connect Google Drive</button>
+      <button id="disconnect" class="secondary" hidden>Disconnect</button>
+    </section>
+
+    <section class="card" id="uploadCard">
+      <h2>Upload File</h2>
+      <input id="fileInput" type="file" multiple hidden />
+      <button id="chooseFile">Choose File</button>
+      <div id="fileMessage" class="muted smallText"></div>
+
+      <div class="divider"></div>
+
+      <h2>Direct URL</h2>
+      <div class="urlRow">
+        <input id="urlInput" type="url" inputmode="url" placeholder="https://example.com/file.zip" />
+        <button id="uploadUrl" class="compact">Upload</button>
+      </div>
+      <div id="urlMessage" class="muted smallText"></div>
+    </section>
+
+    <section class="card">
+      <div class="row"><h2>Uploads</h2><button id="refresh" class="small">Refresh</button></div>
+      <div id="uploads" class="muted">No uploads yet.</div>
+    </section>
+
+    <p class="hint">You can also send any file or direct URL directly to the Telegram bot. Two uploads run at once.</p>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

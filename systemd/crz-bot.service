@@ -1,0 +1,18 @@
+[Unit]
+Description=CRZ Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Project_XTRM/CRZ_Bot
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node backend/crz-index.js
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

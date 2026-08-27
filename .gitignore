@@ -1,0 +1,38 @@
+# Secrets
+.env
+*.env.local
+
+# Dependencies
+node_modules/
+
+# Runtime data
+data/
+downloads/
+temp/
+tmp/
+storage/
+
+# Logs
+*.log
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Patch/install artifacts
+*.zip
+*.tar.gz
+
+# Local backup files
+*.pre-*
+*.bak
+*.backup
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
