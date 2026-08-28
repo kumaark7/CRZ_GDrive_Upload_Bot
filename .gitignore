@@ -36,3 +36,7 @@ venv/
 Thumbs.db
 .vscode/
 .idea/
+
+# Backend storage implementation is source code, not runtime data
+!backend/storage/
+!backend/storage/catalogStore.js

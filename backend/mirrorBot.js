@@ -12,6 +12,10 @@ import { downloadHttpSource, copyLocalTelegramFile } from './mirrorDownload.js';
 import { probeMedia, prepareMkv } from './mediaPrep.js';
 import { preflightTorrent, downloadTorrent } from './torrentWorker.js';
 import { jobManager } from './jobs/jobManager.js';
+import {
+  catalogStore,
+  isCatalogOwner
+} from './storage/catalogStore.js';
 
 const token = process.env.MIRROR_TELEGRAM_BOT_TOKEN || config.telegramToken;
 if (!token) throw new Error('Missing TELEGRAM_BOT_TOKEN');
@@ -847,6 +851,23 @@ async function runTorrentPreflightQueued(session) {
 async function showTorrentReady(session, result, fallbackName = 'Torrent') {
   session.torrentInfo = result;
 
+  if (isCatalogOwner(session.userId)) {
+    try {
+      const savedTorrent = await catalogStore.saveTorrent({
+        source: session.source,
+        info: result,
+        ownerId: session.userId
+      });
+
+      session.catalogTorrentId = savedTorrent.id;
+    } catch (error) {
+      console.error(
+        `[catalog] failed to persist torrent for job ${session.id}:`,
+        error
+      );
+    }
+  }
+
   const videoFiles = result.files
     .filter(f => VIDEO_EXTS.has(path.extname(f.name).toLowerCase()))
     .sort((a, b) => b.size - a.size)
@@ -934,6 +955,32 @@ async function runTorrentDownload(session, fileIndex) {
       startingDetail: selectedTorrentFile?.name || ''
     }
   );
+
+  if (
+    isCatalogOwner(session.userId) &&
+    session.catalogTorrentId
+  ) {
+    try {
+      const savedSource = await catalogStore.persistSourceFile({
+        torrentId: session.catalogTorrentId,
+        fileIndex,
+        sourcePath: result.file_path,
+        filename: result.filename,
+        size: result.size,
+        ownerId: session.userId
+      });
+
+      result.file_path = savedSource.path;
+      result.filename = savedSource.filename;
+      result.size = savedSource.size;
+      session.catalogSourceId = savedSource.id;
+    } catch (error) {
+      console.error(
+        `[catalog] failed to persist source for job ${session.id}:`,
+        error
+      );
+    }
+  }
 
   // Download queue slot is free before ffprobe/media analysis begins.
   jobManager.update(session.id, {
@@ -1182,6 +1229,79 @@ mirrorBot.action(/^mt-cancel:(\d+)$/, async ctx => {
   await cancelSession(s);
 });
 
+async function showAvailableTorrents(ctx) {
+  if (!isCatalogOwner(ctx.from.id)) {
+    await ctx.reply('This menu is owner-only.');
+    return;
+  }
+
+  const torrents = await catalogStore.listTorrents(ctx.from.id);
+
+  if (!torrents.length) {
+    await ctx.reply('📚 Available Torrents\n\nNo saved torrents yet.');
+    return;
+  }
+
+  const shown = torrents.slice(0, 20);
+
+  const rows = shown.map(item => [
+    Markup.button.callback(
+      `🧲 ${String(item.name || 'Torrent').slice(0, 48)}`,
+      `mt-catalog-torrent:${item.id}`
+    )
+  ]);
+
+  await ctx.reply(
+    `📚 Available Torrents\n\nSaved: ${torrents.length}\nShowing: ${shown.length}\n\nThese entries survive CRZ restarts.`,
+    Markup.inlineKeyboard(rows)
+  );
+}
+
+mirrorBot.command('torrents', showAvailableTorrents);
+
+mirrorBot.action(/^mt-catalog-torrent:([a-f0-9]{16})$/, async ctx => {
+  if (!isCatalogOwner(ctx.from.id)) {
+    await ctx.answerCbQuery('Owner only.').catch(() => {});
+    return;
+  }
+
+  const record = await catalogStore.getTorrent(
+    ctx.match[1],
+    ctx.from.id
+  );
+
+  if (!record) {
+    await ctx.answerCbQuery(
+      'This saved torrent is unavailable.'
+    ).catch(() => {});
+    return;
+  }
+
+  await ctx.answerCbQuery('Opening saved torrent...').catch(() => {});
+
+  const session = newSession(ctx, {
+    source: record.source,
+    kind: 'torrent',
+    catalogTorrentId: record.id
+  });
+
+  session.workDir = workDir(session);
+  await fsp.mkdir(session.workDir, { recursive: true });
+
+  await showTorrentReady(
+    session,
+    {
+      name: record.name,
+      health: record.health,
+      seeds: record.seeds,
+      peers: record.peers,
+      trackers: record.trackers,
+      files: record.files
+    },
+    record.name
+  );
+});
+
 mirrorBot.action(/^mt-tfile:(\d+):(\d+)$/, async ctx => {
   const s = getSession(ctx.match[1], ctx.from.id);
 
@@ -1191,6 +1311,7 @@ mirrorBot.action(/^mt-tfile:(\d+):(\d+)$/, async ctx => {
   }
 
   const job = jobManager.get(s.id);
+
   if (
     s.activePromise ||
     job?.state === 'queued' ||
@@ -1201,10 +1322,60 @@ mirrorBot.action(/^mt-tfile:(\d+):(\d+)$/, async ctx => {
     return;
   }
 
+  const fileIndex = Number(ctx.match[2]);
+
+  if (
+    isCatalogOwner(s.userId) &&
+    s.catalogTorrentId
+  ) {
+    const savedSource = await catalogStore.findSource({
+      torrentId: s.catalogTorrentId,
+      fileIndex,
+      ownerId: s.userId
+    });
+
+    if (savedSource) {
+      await ctx.answerCbQuery('Using saved movie source.').catch(() => {});
+      resetSessionAbort(s);
+
+      jobManager.update(s.id, {
+        state: 'running',
+        stage: 'analysis',
+        queueName: null,
+        queuePosition: null
+      });
+
+      try {
+        await setStatus(
+          s,
+          `♻️ Reusing Saved Source\n\n${savedSource.filename}\nSize: ${humanBytes(savedSource.size)}\n\nSkipping torrent download.`
+        );
+
+        await processDownloadedFile(
+          s,
+          savedSource.path,
+          savedSource.filename
+        );
+
+        if (sessions.has(s.id)) {
+          jobManager.markWaitingUser(s.id, {
+            sourceReused: true,
+            catalogSourceId: savedSource.id
+          });
+        }
+      } catch (error) {
+        if (error?.name === 'AbortError') return;
+        await showRecoverableError(s, error, 'torrent');
+      }
+
+      return;
+    }
+  }
+
   await ctx.answerCbQuery('Movie added to download queue.').catch(() => {});
 
   try {
-    await runTorrentDownload(s, Number(ctx.match[2]));
+    await runTorrentDownload(s, fileIndex);
   } catch (error) {
     if (error?.name === 'AbortError') return;
     await showRecoverableError(s, error, 'torrent');
@@ -1343,6 +1514,7 @@ export async function registerMirrorBotCommands() {
   await mirrorBot.telegram.setMyCommands([
     { command: 'start', description: 'Open CRZ Bot' },
     { command: 'help', description: 'Show supported inputs' },
+    { command: 'torrents', description: 'Open saved torrent catalog' },
     { command: 'cancel', description: 'Cancel current job' }
   ]);
 }
