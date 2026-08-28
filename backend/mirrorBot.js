@@ -1357,9 +1357,16 @@ mirrorBot.command('cancel', async ctx => {
   await cancelSession(active);
 });
 
-mirrorBot.on('text', async ctx => {
+mirrorBot.on('text', async (ctx, next) => {
   const text = String(ctx.message.text || '').trim();
-  if (!text || text.startsWith('/')) return;
+
+  // Commands registered later in this file must continue through
+  // Telegraf's middleware chain instead of being swallowed here.
+  if (text.startsWith('/')) {
+    return next();
+  }
+
+  if (!text) return;
 
   try {
     if (text.startsWith('magnet:?')) {
