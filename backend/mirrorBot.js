@@ -14,6 +14,13 @@ import { preflightTorrent, downloadTorrent } from './torrentWorker.js';
 import { jobManager } from './jobs/jobManager.js';
 import { runtimeState } from './storage/runtimeState.js';
 import {
+  buildOwnerJobsText,
+  buildQueuesText,
+  buildStorageText,
+  getOwnerStorageSummary,
+  staleCallbackText
+} from './status/ownerStatus.js';
+import {
   catalogStore,
   isCatalogOwner
 } from './storage/catalogStore.js';
@@ -1788,6 +1795,67 @@ mirrorBot.action(/^mt-retry-torrent:(\d+)$/, async ctx => {
 });
 
 
+
+async function ownerOnly(ctx) {
+  if (isCatalogOwner(ctx.from.id)) {
+    return true;
+  }
+
+  await ctx.reply('This menu is owner-only.');
+  return false;
+}
+
+mirrorBot.command('jobs', async ctx => {
+  if (!(await ownerOnly(ctx))) return;
+
+  const interrupted =
+    await getInterruptedMirrorJobs();
+
+  await ctx.reply(
+    buildOwnerJobsText({
+      jobs: jobManager.snapshot().jobs,
+      interrupted
+    })
+  );
+});
+
+mirrorBot.command('queues', async ctx => {
+  if (!(await ownerOnly(ctx))) return;
+
+  await ctx.reply(
+    buildQueuesText(
+      jobManager.snapshot().queues
+    )
+  );
+});
+
+mirrorBot.command('storage', async ctx => {
+  if (!(await ownerOnly(ctx))) return;
+
+  try {
+    const summary =
+      await getOwnerStorageSummary({
+        storageRoot:
+          catalogStore.root,
+        tempRoot:
+          path.join(
+            os.tmpdir(),
+            'ez-mirror-torrent'
+          )
+      });
+
+    await ctx.reply(
+      buildStorageText(summary)
+    );
+  } catch (error) {
+    await ctx.reply(
+      `❌ Could not read CRZ storage status
+
+${error.message}`
+    );
+  }
+});
+
 let runtimePersistenceTimer = null;
 let runtimeSweepTimer = null;
 
@@ -1910,12 +1978,29 @@ export async function getInterruptedMirrorJobs() {
   return runtimeState.listInterrupted();
 }
 
+
+/*
+ * Final callback fallback.
+ *
+ * Specific mt-* handlers above get first chance to handle valid actions.
+ * Any old/stale button that reaches this point is acknowledged once with a
+ * safe message instead of timing out or throwing.
+ */
+mirrorBot.action(/^mt-/, async ctx => {
+  await ctx.answerCbQuery(
+    staleCallbackText()
+  ).catch(() => {});
+});
+
 export async function registerMirrorBotCommands() {
   await mirrorBot.telegram.setMyCommands([
     { command: 'start', description: 'Open CRZ Bot' },
     { command: 'help', description: 'Show supported inputs' },
     { command: 'torrents', description: 'Open saved torrent catalog' },
     { command: 'movies', description: 'Open processed movie catalog' },
+    { command: 'jobs', description: 'Show active CRZ jobs' },
+    { command: 'queues', description: 'Show CRZ queue usage' },
+    { command: 'storage', description: 'Show CRZ storage usage' },
     { command: 'cancel', description: 'Cancel current job' }
   ]);
 }
