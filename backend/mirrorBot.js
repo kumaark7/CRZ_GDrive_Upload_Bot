@@ -11,6 +11,7 @@ import { safeFetch, filenameFromUrl } from './upload.js';
 import { downloadHttpSource, copyLocalTelegramFile } from './mirrorDownload.js';
 import { probeMedia, prepareMkv } from './mediaPrep.js';
 import { preflightTorrent, downloadTorrent } from './torrentWorker.js';
+import { jobManager } from './jobs/jobManager.js';
 
 const token = process.env.MIRROR_TELEGRAM_BOT_TOKEN || config.telegramToken;
 if (!token) throw new Error('Missing TELEGRAM_BOT_TOKEN');
@@ -27,14 +28,30 @@ const VIDEO_EXTS = new Set(['.mkv', '.mp4', '.webm', '.avi', '.mov', '.m4v', '.t
 
 function newSession(ctx, extra = {}) {
   const id = String(nextId++);
+
+  const job = jobManager.create({
+    id,
+    type: extra.kind || 'legacy-session',
+    userId: ctx.from.id,
+    chatId: ctx.chat.id,
+    metadata: {
+      kind: extra.kind || null
+    }
+  });
+
   const session = {
     id,
     userId: String(ctx.from.id),
     chatId: ctx.chat.id,
     createdAt: Date.now(),
-    abort: new AbortController(),
+
+    // Session and JobManager share the exact same AbortController.
+    abort: job.abortController,
+    job,
+
     ...extra
   };
+
   sessions.set(id, session);
   return session;
 }
@@ -43,6 +60,63 @@ function getSession(id, userId) {
   const s = sessions.get(String(id));
   if (!s || s.userId !== String(userId)) return null;
   return s;
+}
+
+function resetSessionAbort(session) {
+  const controller = new AbortController();
+  session.abort = controller;
+
+  const job = jobManager.get(session.id);
+  if (job) {
+    job.abortController = controller;
+
+    if (
+      job.state === 'cancelled' ||
+      job.state === 'failed' ||
+      job.state === 'completed' ||
+      job.state === 'cancelling'
+    ) {
+      job.state = 'created';
+      job.finishedAt = null;
+      job.error = null;
+      job.result = null;
+      job.updatedAt = Date.now();
+    }
+  }
+
+  return controller;
+}
+
+async function cancelSession(session, {
+  finalText = '🛑 Cancelled'
+} = {}) {
+  if (!session) return false;
+
+  const result = jobManager.cancel(session.id, {
+    userId: session.userId,
+    reason: 'Cancelled by user'
+  });
+
+  // Legacy sessions created before JobManager wiring are still safe.
+  if (!result.ok && result.reason === 'not_found') {
+    if (!session.abort.signal.aborted) {
+      session.abort.abort('Cancelled by user');
+    }
+  }
+
+  // Remove actionable buttons immediately so Cancel cannot be pressed twice.
+  await setStatus(
+    session,
+    '🛑 Cancelling...\n\nStopping the active operation safely.',
+    Markup.inlineKeyboard([])
+  ).catch(() => {});
+
+  // Current worker functions listen to the shared AbortSignal.
+  // TorrentWorker terminates the whole Python process group.
+  await cleanup(session, { finalText });
+
+  jobManager.markCancelled(session.id);
+  return true;
 }
 
 function humanBytes(n) {
@@ -165,6 +239,18 @@ async function cleanup(session, { finalText = null, quiet = false } = {}) {
   }
 
   sessions.delete(session.id);
+
+  const managedJob = jobManager.get(session.id);
+  if (
+    managedJob &&
+    managedJob.state !== 'cancelled' &&
+    managedJob.state !== 'cancelling'
+  ) {
+    jobManager.markCompleted(session.id, {
+      cleanup: true,
+      finalText: finalText || null
+    });
+  }
 
   if (!quiet && finalText) {
     await setStatus(
@@ -813,9 +899,12 @@ mirrorBot.command('cancel', async ctx => {
   const active = [...sessions.values()]
     .filter(s => s.userId === String(ctx.from.id))
     .sort((a, b) => b.createdAt - a.createdAt)[0];
-  if (!active) return ctx.reply('No active job.');
-  active.abort.abort();
-  await cleanup(active, { finalText: '🛑 Cancelled' });
+
+  if (!active) {
+    return ctx.reply('No active job.');
+  }
+
+  await cancelSession(active);
 });
 
 mirrorBot.on('text', async ctx => {
@@ -845,11 +934,19 @@ mirrorBot.on('document', async ctx => {
 });
 
 mirrorBot.action(/^mt-cancel:(\d+)$/, async ctx => {
-  await ctx.answerCbQuery('Cancelling...').catch(() => {});
   const s = getSession(ctx.match[1], ctx.from.id);
-  if (!s) return;
-  s.abort.abort();
-  await cleanup(s, { finalText: '🛑 Cancelled' });
+
+  // Telegram callback queries can only be answered once reliably.
+  // Return a useful stale-button message instead of ACKing twice.
+  if (!s) {
+    await ctx.answerCbQuery('This job is no longer active.').catch(() => {});
+    return;
+  }
+
+  // ACK immediately before any cancellation/cleanup work.
+  await ctx.answerCbQuery('Cancelling...').catch(() => {});
+
+  await cancelSession(s);
 });
 
 mirrorBot.action(/^mt-tfile:(\d+):(\d+)$/, async ctx => {
@@ -911,7 +1008,7 @@ mirrorBot.action(/^mt-ready-upload:(\d+)$/, async ctx => {
   await ctx.answerCbQuery('Starting Drive upload...').catch(() => {});
   const s = getSession(ctx.match[1], ctx.from.id);
   if (!s) return;
-  s.abort = new AbortController();
+  resetSessionAbort(s);
   await uploadReadyFile(s);
 });
 
@@ -919,7 +1016,7 @@ mirrorBot.action(/^mt-ready-download:(\d+)$/, async ctx => {
   await ctx.answerCbQuery('Preparing download...').catch(() => {});
   const s = getSession(ctx.match[1], ctx.from.id);
   if (!s) return;
-  s.abort = new AbortController();
+  resetSessionAbort(s);
   await downloadReadyFile(s);
 });
 
@@ -934,7 +1031,7 @@ mirrorBot.action(/^mt-retry-upload:(\d+)$/, async ctx => {
   await ctx.answerCbQuery('Retrying upload...').catch(() => {});
   const s = getSession(ctx.match[1], ctx.from.id);
   if (!s) return;
-  s.abort = new AbortController();
+  resetSessionAbort(s);
   await uploadReadyFile(s);
 });
 
@@ -942,7 +1039,7 @@ mirrorBot.action(/^mt-retry-process:(\d+)$/, async ctx => {
   await ctx.answerCbQuery('Retrying processing...').catch(() => {});
   const s = getSession(ctx.match[1], ctx.from.id);
   if (!s) return;
-  s.abort = new AbortController();
+  resetSessionAbort(s);
   try {
     await runMediaPrep(s);
   } catch (error) {
@@ -955,7 +1052,7 @@ mirrorBot.action(/^mt-retry-copy:(\d+)$/, async ctx => {
   await ctx.answerCbQuery('Retrying local copy...').catch(() => {});
   const s = getSession(ctx.match[1], ctx.from.id);
   if (!s) return;
-  s.abort = new AbortController();
+  resetSessionAbort(s);
   await runTelegramMkvCopy(s);
 });
 
@@ -963,7 +1060,7 @@ mirrorBot.action(/^mt-retry-torrent:(\d+)$/, async ctx => {
   await ctx.answerCbQuery('Retrying torrent...').catch(() => {});
   const s = getSession(ctx.match[1], ctx.from.id);
   if (!s || s.selectedTorrentFileIndex == null) return;
-  s.abort = new AbortController();
+  resetSessionAbort(s);
   await runTorrentDownload(s, s.selectedTorrentFileIndex);
 });
 
