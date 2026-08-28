@@ -234,7 +234,8 @@ export class JobManager {
   async enqueue(
     id,
     queueName,
-    runner
+    runner,
+    hooks = {}
   ) {
     const job =
       this.get(id);
@@ -300,6 +301,18 @@ export class JobManager {
               job.updatedAt =
                 timestamp();
             }
+
+            try {
+              hooks.onQueued?.({
+                job,
+                ...info
+              });
+            } catch (error) {
+              console.error(
+                `[job:${job.id}] onQueued hook failed:`,
+                error
+              );
+            }
           },
 
           onStart: () => {
@@ -315,6 +328,18 @@ export class JobManager {
 
             job.updatedAt =
               timestamp();
+
+            try {
+              hooks.onStart?.({
+                job,
+                queue: queueName
+              });
+            } catch (error) {
+              console.error(
+                `[job:${job.id}] onStart hook failed:`,
+                error
+              );
+            }
           },
 
           run: async () => {

@@ -339,3 +339,55 @@ test(
     );
   }
 );
+
+
+test(
+  'queue lifecycle hooks report queued position and start',
+  async () => {
+    const queues = new QueueManager({ preflight: 1 });
+    const jobs = new JobManager({ queues });
+    const one = jobs.create({ id: 'hook-one', type: 'preflight', userId: '1', chatId: 1 });
+    const two = jobs.create({ id: 'hook-two', type: 'preflight', userId: '1', chatId: 1 });
+    const events = [];
+
+    const p1 = jobs.enqueue(one.id, 'preflight', async () => {
+      await sleep(60);
+      return 'one';
+    });
+
+    const p2 = jobs.enqueue(two.id, 'preflight', async () => 'two', {
+      onQueued: info => events.push(`queued:${info.position}`),
+      onStart: () => events.push('started')
+    });
+
+    await Promise.all([p1, p2]);
+    assert.ok(events.some(value => value.startsWith('queued:')));
+    assert.ok(events.includes('started'));
+  }
+);
+
+test(
+  'preflight and download queues do not block each other',
+  async () => {
+    const queues = new QueueManager({ preflight: 1, download: 1 });
+    const jobs = new JobManager({ queues });
+    const preflight = jobs.create({ id: 'independent-preflight', type: 'preflight', userId: '1', chatId: 1 });
+    const download = jobs.create({ id: 'independent-download', type: 'download', userId: '1', chatId: 1 });
+    let downloadStarted = false;
+
+    const p1 = jobs.enqueue(preflight.id, 'preflight', async () => {
+      await sleep(80);
+      return 'preflight';
+    });
+
+    const p2 = jobs.enqueue(download.id, 'download', async () => {
+      downloadStarted = true;
+      await sleep(10);
+      return 'download';
+    });
+
+    await sleep(20);
+    assert.equal(downloadStarted, true);
+    await Promise.all([p1, p2]);
+  }
+);

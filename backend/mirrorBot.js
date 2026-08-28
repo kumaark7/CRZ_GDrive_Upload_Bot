@@ -87,6 +87,67 @@ function resetSessionAbort(session) {
   return controller;
 }
 
+function queueDisplayName(queueName) {
+  if (queueName === 'preflight') return 'Torrent preflight';
+  if (queueName === 'download') return 'Movie download';
+  if (queueName === 'processing') return 'MKV processing';
+  if (queueName === 'upload') return 'Google Drive upload';
+  return queueName;
+}
+
+async function enqueueSessionStage(
+  session,
+  queueName,
+  runner,
+  {
+    queuedDetail = '',
+    startingDetail = ''
+  } = {}
+) {
+  if (session.activePromise) {
+    const error = new Error('This job already has an active stage');
+    error.code = 'JOB_ALREADY_ACTIVE';
+    throw error;
+  }
+
+  const label = queueDisplayName(queueName);
+
+  const promise = jobManager.enqueue(
+    session.id,
+    queueName,
+    runner,
+    {
+      onQueued: info => {
+        const detail = queuedDetail ? `\n\n${queuedDetail}` : '';
+        void setStatus(
+          session,
+          `⏳ ${label} queued\n\nQueue position: ${info.position}\nActive: ${info.active} / ${info.concurrency}${detail}`,
+          cancelKeyboard(session.id)
+        ).catch(() => {});
+      },
+
+      onStart: () => {
+        const detail = startingDetail ? `\n\n${startingDetail}` : '';
+        void setStatus(
+          session,
+          `▶️ ${label} starting...${detail}`,
+          cancelKeyboard(session.id)
+        ).catch(() => {});
+      }
+    }
+  );
+
+  session.activePromise = promise;
+
+  try {
+    return await promise;
+  } finally {
+    if (session.activePromise === promise) {
+      session.activePromise = null;
+    }
+  }
+}
+
 async function cancelSession(session, {
   finalText = '🛑 Cancelled'
 } = {}) {
@@ -111,8 +172,12 @@ async function cancelSession(session, {
     Markup.inlineKeyboard([])
   ).catch(() => {});
 
-  // Current worker functions listen to the shared AbortSignal.
-  // TorrentWorker terminates the whole Python process group.
+  // Wait until a queued item is removed or an active worker has really stopped.
+  const activePromise = session.activePromise;
+  if (activePromise) {
+    await activePromise.catch(() => {});
+  }
+
   await cleanup(session, { finalText });
 
   jobManager.markCancelled(session.id);
@@ -618,32 +683,51 @@ async function runMediaPrep(session) {
   await showPreparedChoices(session);
 }
 
-async function beginTorrentPreflight(ctx, source) {
-  const session = newSession(ctx, { source, kind: 'torrent' });
-  session.workDir = workDir(session);
-  await fsp.mkdir(session.workDir, { recursive: true });
+async function runTorrentPreflightQueued(session) {
+  return enqueueSessionStage(
+    session,
+    'preflight',
+    async ({ signal }) => {
+      const result = await preflightTorrent(
+        session.source,
+        session.workDir,
+        {
+          signal,
+          onEvent: event => {
+            if (event.type === 'metadata') {
+              void setStatus(
+                session,
+                `🧲 Torrent Check\n\nFetching metadata...\nElapsed: ${humanDuration(event.elapsed)}\nPeers seen: ${event.peers}\nSeeds seen: ${event.seeds}`
+              );
+            } else if (event.type === 'health') {
+              void setStatus(
+                session,
+                `🧲 Torrent Check\n\nMetadata received ✅\nChecking swarm...\n\nHealth: ${event.health}\nSeeds seen: ${event.seeds}\nPeers seen: ${event.peers}\nTrackers: ${event.trackers}\nElapsed: ${humanDuration(event.elapsed)}`
+              );
+            }
+          }
+        }
+      );
 
-  await setStatus(session,
-    `🧲 Torrent Check\n\nFetching metadata and checking swarm health...\n\nThis does not start the full movie download.`
-  );
+      jobManager.markWaitingUser(session.id, {
+        preflightComplete: true
+      });
+      jobManager.update(session.id, {
+        stage: 'torrent-selection'
+      });
 
-
-  const result = await preflightTorrent(source, session.workDir, {
-    signal: session.abort.signal,
-    onEvent: event => {
-      if (event.type === 'metadata') {
-        void setStatus(session,
-          `🧲 Torrent Check\n\nFetching metadata...\nElapsed: ${humanDuration(event.elapsed)}\nPeers seen: ${event.peers}\nSeeds seen: ${event.seeds}`
-        );
-      } else if (event.type === 'health') {
-        void setStatus(session,
-          `🧲 Torrent Check\n\nMetadata received ✅\nChecking swarm...\n\nHealth: ${event.health}\nSeeds seen: ${event.seeds}\nPeers seen: ${event.peers}\nTrackers: ${event.trackers}\nElapsed: ${humanDuration(event.elapsed)}`
-        );
-      }
+      return result;
+    },
+    {
+      queuedDetail: 'Waiting for a torrent-check slot.',
+      startingDetail: 'Fetching metadata and checking swarm health.'
     }
-  });
+  );
+}
 
+async function showTorrentReady(session, result, fallbackName = 'Torrent') {
   session.torrentInfo = result;
+
   const videoFiles = result.files
     .filter(f => VIDEO_EXTS.has(path.extname(f.name).toLowerCase()))
     .sort((a, b) => b.size - a.size)
@@ -659,48 +743,100 @@ async function beginTorrentPreflight(ctx, source) {
   ]);
   rows.push([Markup.button.callback('🛑 Cancel / Try Another', `mt-cancel:${session.id}`)]);
 
-  await setStatus(session,
-    `🧲 Torrent Ready\n\n${result.name || 'Torrent'}\n\nHealth: ${result.health}\nSeeds seen: ${result.seeds}\nPeers seen: ${result.peers}\nTrackers: ${result.trackers}\n\nChoose the movie to download.\nIf health looks poor, cancel and send another torrent.`,
+  await setStatus(
+    session,
+    `🧲 Torrent Ready\n\n${result.name || fallbackName}\n\nHealth: ${result.health}\nSeeds seen: ${result.seeds}\nPeers seen: ${result.peers}\nTrackers: ${result.trackers}\n\nChoose the movie to download.`,
     Markup.inlineKeyboard(rows)
   );
 }
 
-async function runTorrentDownload(session, fileIndex) {
+async function beginTorrentPreflight(ctx, source) {
+  const session = newSession(ctx, { source, kind: 'torrent' });
+  session.workDir = workDir(session);
+  await fsp.mkdir(session.workDir, { recursive: true });
+
+  try {
+    const result = await runTorrentPreflightQueued(session);
+    await showTorrentReady(session, result);
+  } catch (error) {
+    if (error?.name === 'AbortError') return;
+    throw error;
+  }
+}
+
+async function executeTorrentDownload(session, fileIndex, signal) {
   session.selectedTorrentFileIndex = Number(fileIndex);
-  const selectedTorrentFile = session.torrentInfo?.files?.find(f => Number(f.index) === Number(fileIndex));
+  const selectedTorrentFile = session.torrentInfo?.files?.find(
+    f => Number(f.index) === Number(fileIndex)
+  );
 
   if (selectedTorrentFile?.size) {
-    try {
-      await ensureServerSpace(Number(selectedTorrentFile.size), 2.15, session.workDir || os.tmpdir());
-    } catch (error) {
-      return showRecoverableError(session, error, 'torrent');
-    }
+    await ensureServerSpace(
+      Number(selectedTorrentFile.size),
+      2.15,
+      session.workDir || os.tmpdir()
+    );
   }
 
-  await setStatus(session, `🧲 Starting Torrent\n\nConnecting to peers and measuring real download speed...`);
-
-  const result = await downloadTorrent(session.source, session.workDir, fileIndex, {
-    signal: session.abort.signal,
+  return downloadTorrent(session.source, session.workDir, fileIndex, {
+    signal,
     onEvent: event => {
       if (event.type === 'metadata') {
-        void setStatus(session,
+        void setStatus(
+          session,
           `🧲 Starting Torrent\n\nFetching metadata...\nPeers: ${event.peers}\nSeeds: ${event.seeds}\nElapsed: ${humanDuration(event.elapsed)}`
         );
       } else if (event.type === 'progress') {
         const warning = event.elapsed >= 20 && event.speed < 512 * 1024
           ? '\n\n⚠️ Torrent is currently slow. You can cancel and try another.'
           : '';
-        void setStatus(session,
+        void setStatus(
+          session,
           `🧲 Torrent Download\n\nProgress: ${event.percent}%\nDownloaded: ${humanBytes(event.done)} / ${humanBytes(event.total)}\nSpeed: ${humanBytes(event.speed)}/s\nSeeds: ${event.seeds}\nPeers: ${event.peers}\nElapsed: ${humanDuration(event.elapsed)}\nETA: ${humanDuration(event.eta)}${warning}`
         );
       }
     }
   });
+}
 
-  await setStatus(session,
-    `✅ Torrent Download Complete\n\n${result.filename}\nSize: ${humanBytes(result.size)}\n\nAnalyzing file...`
+async function runTorrentDownload(session, fileIndex) {
+  const selectedTorrentFile = session.torrentInfo?.files?.find(
+    f => Number(f.index) === Number(fileIndex)
   );
-  return processDownloadedFile(session, result.file_path, result.filename);
+
+  const result = await enqueueSessionStage(
+    session,
+    'download',
+    async ({ signal }) => executeTorrentDownload(session, fileIndex, signal),
+    {
+      queuedDetail: selectedTorrentFile
+        ? `${selectedTorrentFile.name}\n${humanBytes(selectedTorrentFile.size)}`
+        : 'Waiting for a movie-download slot.',
+      startingDetail: selectedTorrentFile?.name || ''
+    }
+  );
+
+  // Download queue slot is free before ffprobe/media analysis begins.
+  jobManager.update(session.id, {
+    state: 'running',
+    stage: 'analysis',
+    queueName: null,
+    queuePosition: null
+  });
+
+  await setStatus(
+    session,
+    `✅ Torrent Download Complete\n\n${result.filename}\nSize: ${humanBytes(result.size)}\n\n🔎 Analyzing file immediately...`
+  );
+
+  await processDownloadedFile(session, result.file_path, result.filename);
+
+  if (sessions.has(session.id)) {
+    const job = jobManager.get(session.id);
+    if (job && !jobManager.isTerminal(job)) {
+      jobManager.markWaitingUser(session.id, { downloadComplete: true });
+    }
+  }
 }
 
 async function beginResolvedSource(ctx, source) {
@@ -833,36 +969,14 @@ async function handleTelegramDocument(ctx, doc) {
     session.kind = 'torrent';
     session.source = { kind: 'torrent', value: torrentPath };
 
-    const result = await preflightTorrent(session.source, session.workDir, {
-      signal: session.abort.signal,
-      onEvent: event => {
-        if (event.type === 'health') {
-          void setStatus(session,
-            `🧲 Torrent Check\n\nHealth: ${event.health}\nSeeds seen: ${event.seeds}\nPeers seen: ${event.peers}\nTrackers: ${event.trackers}\nElapsed: ${humanDuration(event.elapsed)}`
-          );
-        }
-      }
-    });
-    session.torrentInfo = result;
+    try {
+      const result = await runTorrentPreflightQueued(session);
+      await showTorrentReady(session, result, filename);
+    } catch (error) {
+      if (error?.name === 'AbortError') return;
+      throw error;
+    }
 
-    const videoFiles = result.files
-      .filter(f => VIDEO_EXTS.has(path.extname(f.name).toLowerCase()))
-      .sort((a, b) => b.size - a.size)
-      .slice(0, 8);
-    if (!videoFiles.length) throw new Error('No supported video files found in this torrent');
-
-    const rows = videoFiles.map(f => [
-      Markup.button.callback(
-        `▶️ ${f.name.slice(0, 42)} · ${humanBytes(f.size)}`,
-        `mt-tfile:${session.id}:${f.index}`
-      )
-    ]);
-    rows.push([Markup.button.callback('🛑 Cancel / Try Another', `mt-cancel:${session.id}`)]);
-
-    await setStatus(session,
-      `🧲 Torrent Ready\n\n${result.name || filename}\n\nHealth: ${result.health}\nSeeds seen: ${result.seeds}\nPeers seen: ${result.peers}\nTrackers: ${result.trackers}\n\nChoose the movie to download.`,
-      Markup.inlineKeyboard(rows)
-    );
     return;
   }
 
@@ -950,9 +1064,26 @@ mirrorBot.action(/^mt-cancel:(\d+)$/, async ctx => {
 });
 
 mirrorBot.action(/^mt-tfile:(\d+):(\d+)$/, async ctx => {
-  await ctx.answerCbQuery('Starting download...').catch(() => {});
   const s = getSession(ctx.match[1], ctx.from.id);
-  if (!s) return;
+
+  if (!s) {
+    await ctx.answerCbQuery('This job is no longer active.').catch(() => {});
+    return;
+  }
+
+  const job = jobManager.get(s.id);
+  if (
+    s.activePromise ||
+    job?.state === 'queued' ||
+    job?.state === 'running' ||
+    job?.state === 'cancelling'
+  ) {
+    await ctx.answerCbQuery('This job is already active.').catch(() => {});
+    return;
+  }
+
+  await ctx.answerCbQuery('Movie added to download queue.').catch(() => {});
+
   try {
     await runTorrentDownload(s, Number(ctx.match[2]));
   } catch (error) {
