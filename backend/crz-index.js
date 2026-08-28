@@ -2,7 +2,12 @@ import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { config } from './config.js';
-import { mirrorBot, registerMirrorBotCommands } from './mirrorBot.js';
+import {
+  mirrorBot,
+  registerMirrorBotCommands,
+  initializeMirrorRuntime,
+  shutdownMirrorRuntime
+} from './mirrorBot.js';
 import { createGoogleAuthUrl, finishGoogleAuth } from './oauth.js';
 import { disconnect, isConnected } from './db.js';
 import { verifyInitData } from './telegramAuth.js';
@@ -314,6 +319,15 @@ server.requestTimeout = 0;
  */
 
 try {
+  await initializeMirrorRuntime();
+} catch (error) {
+  console.error(
+    'Could not initialize CRZ runtime recovery:',
+    error
+  );
+}
+
+try {
   await registerMirrorBotCommands();
 } catch (error) {
   console.error(
@@ -451,6 +465,15 @@ async function shutdown(signal) {
   } catch (error) {
     console.error(
       'HTTP server shutdown error:',
+      error.message
+    );
+  }
+
+  try {
+    await shutdownMirrorRuntime();
+  } catch (error) {
+    console.error(
+      'CRZ runtime persistence shutdown error:',
       error.message
     );
   }

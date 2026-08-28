@@ -12,6 +12,7 @@ import { downloadHttpSource, copyLocalTelegramFile } from './mirrorDownload.js';
 import { probeMedia, prepareMkv } from './mediaPrep.js';
 import { preflightTorrent, downloadTorrent } from './torrentWorker.js';
 import { jobManager } from './jobs/jobManager.js';
+import { runtimeState } from './storage/runtimeState.js';
 import {
   catalogStore,
   isCatalogOwner
@@ -333,17 +334,46 @@ async function cleanup(session, { finalText = null, quiet = false } = {}) {
 }
 
 
-const DISK_RESERVE_BYTES = Number(process.env.CRZ_DISK_RESERVE_BYTES || 1024 * 1024 * 1024);
+const MIN_DISK_RESERVE_BYTES = Number(
+  process.env.CRZ_DISK_RESERVE_BYTES ||
+  5 * 1024 * 1024 * 1024
+);
+
+async function getDiskStats(target = os.tmpdir()) {
+  const stat = await fsp.statfs(target);
+  const blockSize = Number(stat.bsize);
+  const availableBytes =
+    Number(stat.bavail) * blockSize;
+  const totalBytes =
+    Number(stat.blocks) * blockSize;
+
+  return {
+    availableBytes,
+    totalBytes
+  };
+}
 
 async function getFreeDiskBytes(target = os.tmpdir()) {
-  const stat = await fsp.statfs(target);
-  return Number(stat.bavail) * Number(stat.bsize);
+  return (await getDiskStats(target)).availableBytes;
 }
 
 async function ensureServerSpace(expectedBytes, multiplier = 1, target = os.tmpdir()) {
   if (!Number.isFinite(expectedBytes) || expectedBytes <= 0) return;
-  const available = await getFreeDiskBytes(target);
-  const required = Math.ceil(expectedBytes * multiplier + DISK_RESERVE_BYTES);
+
+  const {
+    availableBytes: available,
+    totalBytes
+  } = await getDiskStats(target);
+
+  const reserve = Math.max(
+    MIN_DISK_RESERVE_BYTES,
+    Math.ceil(totalBytes * 0.10)
+  );
+
+  const required = Math.ceil(
+    expectedBytes * multiplier + reserve
+  );
+
   if (available < required) {
     const error = new Error('Server temporary storage is too low');
     error.code = 'SERVER_STORAGE_LOW';
@@ -1756,6 +1786,129 @@ mirrorBot.action(/^mt-retry-torrent:(\d+)$/, async ctx => {
   resetSessionAbort(s);
   await runTorrentDownload(s, s.selectedTorrentFileIndex);
 });
+
+
+let runtimePersistenceTimer = null;
+let runtimeSweepTimer = null;
+
+function runtimeSessionSnapshot() {
+  return [...sessions.values()].map(session => ({
+    id: session.id,
+    userId: session.userId,
+    chatId: session.chatId,
+    createdAt: session.createdAt,
+    kind: session.kind || null,
+    source: session.source || null,
+    workDir: session.workDir || null,
+    filename: session.filename || null,
+    inputPath: session.inputPath || null,
+    readyFilePath: session.readyFilePath || null,
+    readyFilename: session.readyFilename || null,
+    selectedTorrentFileIndex:
+      session.selectedTorrentFileIndex ?? null,
+    catalogTorrentId:
+      session.catalogTorrentId || null,
+    catalogSourceId:
+      session.catalogSourceId || null,
+    catalogVariantId:
+      session.catalogVariantId || null
+  }));
+}
+
+async function persistMirrorRuntime() {
+  await runtimeState.saveRuntime({
+    jobs: jobManager.snapshot().jobs,
+    sessions: runtimeSessionSnapshot()
+  });
+}
+
+async function sweepMirrorTemp() {
+  const protectedPaths =
+    [...sessions.values()]
+      .map(session => session.workDir)
+      .filter(Boolean);
+
+  const result =
+    await runtimeState.sweepTemp({
+      protectedPaths
+    });
+
+  if (result.removed > 0) {
+    console.log(
+      `CRZ temp cleanup: removed=${result.removed} freed=${result.freedBytes}`
+    );
+  }
+
+  return result;
+}
+
+export async function initializeMirrorRuntime() {
+  const interrupted =
+    await runtimeState
+      .markPreviousRunInterrupted();
+
+  if (interrupted.length) {
+    console.log(
+      `CRZ recovery: ${interrupted.length} interrupted job(s) marked retryable`
+    );
+  }
+
+  await sweepMirrorTemp();
+
+  if (!runtimePersistenceTimer) {
+    runtimePersistenceTimer =
+      setInterval(
+        () => {
+          persistMirrorRuntime()
+            .catch(error => {
+              console.error(
+                'CRZ runtime persistence error:',
+                error.message
+              );
+            });
+        },
+        5000
+      );
+
+    runtimePersistenceTimer.unref();
+  }
+
+  if (!runtimeSweepTimer) {
+    runtimeSweepTimer =
+      setInterval(
+        () => {
+          sweepMirrorTemp()
+            .catch(error => {
+              console.error(
+                'CRZ temp sweep error:',
+                error.message
+              );
+            });
+        },
+        10 * 60 * 1000
+      );
+
+    runtimeSweepTimer.unref();
+  }
+}
+
+export async function shutdownMirrorRuntime() {
+  if (runtimePersistenceTimer) {
+    clearInterval(runtimePersistenceTimer);
+    runtimePersistenceTimer = null;
+  }
+
+  if (runtimeSweepTimer) {
+    clearInterval(runtimeSweepTimer);
+    runtimeSweepTimer = null;
+  }
+
+  await persistMirrorRuntime();
+}
+
+export async function getInterruptedMirrorJobs() {
+  return runtimeState.listInterrupted();
+}
 
 export async function registerMirrorBotCommands() {
   await mirrorBot.telegram.setMyCommands([
