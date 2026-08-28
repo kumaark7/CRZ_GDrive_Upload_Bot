@@ -608,6 +608,62 @@ async function uploadPrepared(session, filePath, filename, mimeType = 'video/x-m
   );
 }
 
+async function presentMediaSelection(
+  session,
+  filePath,
+  filename,
+  media
+) {
+  if (!media.audio.length) {
+    throw new Error('No audio streams found in this MKV');
+  }
+
+  session.inputPath = filePath;
+  session.filename = filename;
+  session.media = media;
+
+  if (media.audio.length === 1) {
+    session.selectedAudio = media.audio[0];
+
+    await setStatus(
+      session,
+      `🎧 Audio Track\n\n${filename}\n\nOnly one audio track was found:\n${media.audio[0].language} · ${media.audio[0].codec.toUpperCase()}${media.audio[0].channels ? ` · ${media.audio[0].channels}ch` : ''}\n\nUsing this track automatically...`
+    );
+
+    return askSubtitle(session);
+  }
+
+  session.selectedAudio = null;
+  const shownAudio = media.audio.slice(0, 12);
+
+  const isEnglishAudio = a =>
+    String(a.language || '').trim().toLowerCase() === 'english';
+
+  const rows = shownAudio.map((a, i) => [
+    Markup.button.callback(
+      `${isEnglishAudio(a) ? '⭐ ' : ''}${a.language} · ${a.codec.toUpperCase()}${a.channels ? ` · ${a.channels}ch` : ''}`,
+      `mt-audio:${session.id}:${i}`
+    )
+  ]);
+
+  rows.push([
+    Markup.button.callback('🛑 Cancel', `mt-cancel:${session.id}`)
+  ]);
+
+  const summary = shownAudio
+    .map(
+      (a, i) =>
+        `${i + 1}. ${isEnglishAudio(a) ? '⭐ ' : ''}${a.language} · ${a.codec.toUpperCase()}${a.channels ? ` · ${a.channels}ch` : ''}${a.supported ? ' ✅' : ' → conversion'}`
+    )
+    .join('\n');
+
+  await setStatus(
+    session,
+    `🎧 Choose Audio\n\n${filename}\n\n${summary}\n\n⭐ = English recommended\nNo audio track is selected automatically.`,
+    Markup.inlineKeyboard(rows)
+  );
+}
+
 async function processDownloadedFile(session, filePath, filename) {
   const ext = path.extname(filename).toLowerCase();
 
@@ -639,47 +695,53 @@ async function processDownloadedFile(session, filePath, filename) {
     return cleanup(session);
   }
 
-  await setStatus(session, `🔎 Analyzing MKV\n\n${filename}\n\nReading video, audio and subtitle tracks...`);
-  const media = await probeMedia(filePath);
-  if (!media.audio.length) throw new Error('No audio streams found in this MKV');
+  let media = null;
 
-  session.inputPath = filePath;
-  session.filename = filename;
-  session.media = media;
-
-  if (media.audio.length === 1) {
-    session.selectedAudio = media.audio[0];
-    await setStatus(
-      session,
-      `🎧 Audio Track\n\n${filename}\n\nOnly one audio track was found:\n${media.audio[0].language} · ${media.audio[0].codec.toUpperCase()}${media.audio[0].channels ? ` · ${media.audio[0].channels}ch` : ''}\n\nUsing this track automatically...`
+  if (isCatalogOwner(session.userId) && session.catalogSourceId) {
+    const savedMetadata = await catalogStore.getMediaMetadata(
+      session.catalogSourceId,
+      session.userId
     );
-    return askSubtitle(session);
+
+    if (savedMetadata?.media) {
+      media = savedMetadata.media;
+
+      await setStatus(
+        session,
+        `♻️ Reusing Saved Analysis\n\n${filename}\n\nSkipping ffprobe.`
+      );
+    }
   }
 
-  // With 2+ audio tracks, NEVER auto-select a track.
-  // English may be marked as recommended, but the user must tap a button.
-  session.selectedAudio = null;
+  if (!media) {
+    await setStatus(
+      session,
+      `🔎 Analyzing MKV\n\n${filename}\n\nReading video, audio and subtitle tracks...`
+    );
 
-  const shownAudio = media.audio.slice(0, 12);
-  const isEnglishAudio = a =>
-    String(a.language || '').trim().toLowerCase() === 'english';
+    media = await probeMedia(filePath);
 
-  const rows = shownAudio.map((a, i) => [
-    Markup.button.callback(
-      `${isEnglishAudio(a) ? '⭐ ' : ''}${a.language} · ${a.codec.toUpperCase()}${a.channels ? ` · ${a.channels}ch` : ''}`,
-      `mt-audio:${session.id}:${i}`
-    )
-  ]);
-  rows.push([Markup.button.callback('🛑 Cancel', `mt-cancel:${session.id}`)]);
+    if (isCatalogOwner(session.userId) && session.catalogSourceId) {
+      try {
+        await catalogStore.saveMediaMetadata({
+          sourceId: session.catalogSourceId,
+          media,
+          ownerId: session.userId
+        });
+      } catch (error) {
+        console.error(
+          `[catalog] failed to persist media metadata for job ${session.id}:`,
+          error
+        );
+      }
+    }
+  }
 
-  const summary = shownAudio.map((a, i) =>
-    `${i + 1}. ${isEnglishAudio(a) ? '⭐ ' : ''}${a.language} · ${a.codec.toUpperCase()}${a.channels ? ` · ${a.channels}ch` : ''}${a.supported ? ' ✅' : ' → conversion'}`
-  ).join('\n');
-
-  await setStatus(
+  return presentMediaSelection(
     session,
-    `🎧 Choose Audio\n\n${filename}\n\n${summary}\n\n⭐ = English recommended\nNo audio track is selected automatically.`,
-    Markup.inlineKeyboard(rows)
+    filePath,
+    filename,
+    media
   );
 }
 
@@ -712,12 +774,64 @@ async function askSubtitle(session) {
   );
 }
 
+function selectedOutputCodec(session) {
+  if (session.selectedAudio.supported) {
+    return session.selectedAudio.codec;
+  }
+
+  return String(
+    process.env.MIRROR_AUDIO_TARGET || 'AAC'
+  ).toLowerCase();
+}
+
+async function applySavedVariant(session, variant) {
+  session.readyFilePath = variant.path;
+  session.readyFilename = variant.filename;
+  session.readyMimeType = 'video/x-matroska';
+  session.readySize = variant.size;
+  session.readyOutputCodec = variant.outputCodec;
+  session.catalogVariantId = variant.id;
+
+  jobManager.markWaitingUser(session.id, {
+    variantReused: true,
+    catalogVariantId: variant.id
+  });
+
+  jobManager.update(session.id, {
+    stage: 'prepared'
+  });
+
+  await setStatus(
+    session,
+    `♻️ Prepared Variant Already Exists\n\n${variant.filename}\nSize: ${humanBytes(variant.size)}\n\nSkipping FFmpeg.`
+  );
+
+  await showPreparedChoices(session);
+}
+
 async function runMediaPrep(session) {
   const base = path.basename(
     session.filename,
     path.extname(session.filename)
   );
+
   const lang = session.selectedAudio.language || 'Audio';
+  const outputCodec = selectedOutputCodec(session);
+
+  if (isCatalogOwner(session.userId) && session.catalogSourceId) {
+    const existing = await catalogStore.findVariant({
+      sourceId: session.catalogSourceId,
+      audioIndex: session.selectedAudio.index,
+      keepEnglishSubtitle: session.keepEnglishSubtitle,
+      outputCodec,
+      ownerId: session.userId
+    });
+
+    if (existing) {
+      return applySavedVariant(session, existing);
+    }
+  }
+
   const outputPath = path.join(
     session.workDir,
     `${base} [${lang}].mkv`
@@ -731,11 +845,7 @@ async function runMediaPrep(session) {
       session.workDir || os.tmpdir()
     );
   } catch (error) {
-    return showRecoverableError(
-      session,
-      error,
-      'process'
-    );
+    return showRecoverableError(session, error, 'process');
   }
 
   try {
@@ -759,8 +869,7 @@ async function runMediaPrep(session) {
           durationSeconds: session.media.durationSeconds,
           signal,
           onProgress: p => {
-            const elapsed =
-              (Date.now() - started) / 1000;
+            const elapsed = (Date.now() - started) / 1000;
 
             void setStatus(
               session,
@@ -770,25 +879,53 @@ async function runMediaPrep(session) {
         });
       },
       {
-        queuedDetail:
-          `${session.filename}\nAudio: ${lang}`,
-        startingDetail:
-          `${session.filename}\nAudio: ${lang}`
+        queuedDetail: `${session.filename}\nAudio: ${lang}`,
+        startingDetail: `${session.filename}\nAudio: ${lang}`
       }
     );
 
-    const finalName = path.basename(result.outputPath);
+    let finalPath = result.outputPath;
+    let finalName = path.basename(result.outputPath);
+    let finalSize = result.size;
+    let variant = null;
 
-    session.readyFilePath = result.outputPath;
+    if (isCatalogOwner(session.userId) && session.catalogSourceId) {
+      try {
+        variant = await catalogStore.persistVariantFile({
+          sourceId: session.catalogSourceId,
+          audioIndex: session.selectedAudio.index,
+          audioLanguage: session.selectedAudio.language,
+          keepEnglishSubtitle: session.keepEnglishSubtitle,
+          outputCodec: result.outputCodec,
+          variantPath: result.outputPath,
+          filename: finalName,
+          size: result.size,
+          ownerId: session.userId
+        });
+
+        finalPath = variant.path;
+        finalName = variant.filename;
+        finalSize = variant.size;
+        session.catalogVariantId = variant.id;
+      } catch (error) {
+        console.error(
+          `[catalog] failed to persist variant for job ${session.id}:`,
+          error
+        );
+      }
+    }
+
+    session.readyFilePath = finalPath;
     session.readyFilename = finalName;
     session.readyMimeType = 'video/x-matroska';
-    session.readySize = result.size;
+    session.readySize = finalSize;
     session.readyOutputCodec = result.outputCodec;
 
     jobManager.markWaitingUser(session.id, {
       processingComplete: true,
       readyFilePath: session.readyFilePath,
-      readyFilename: session.readyFilename
+      readyFilename: session.readyFilename,
+      catalogVariantId: variant?.id || null
     });
 
     jobManager.update(session.id, {
@@ -798,11 +935,7 @@ async function runMediaPrep(session) {
     await showPreparedChoices(session);
   } catch (error) {
     if (error?.name === 'AbortError') return;
-    await showRecoverableError(
-      session,
-      error,
-      'process'
-    );
+    await showRecoverableError(session, error, 'process');
   }
 }
 
@@ -1229,6 +1362,99 @@ mirrorBot.action(/^mt-cancel:(\d+)$/, async ctx => {
   await cancelSession(s);
 });
 
+async function showProcessedMovies(ctx) {
+  if (!isCatalogOwner(ctx.from.id)) {
+    await ctx.reply('This menu is owner-only.');
+    return;
+  }
+
+  const movies = await catalogStore.listProcessedMovies(ctx.from.id);
+
+  if (!movies.length) {
+    await ctx.reply(
+      '🎬 Processed Movies\n\nNo persistent movie sources yet.'
+    );
+    return;
+  }
+
+  const shown = movies.slice(0, 20);
+
+  const rows = shown.map(item => [
+    Markup.button.callback(
+      `🎬 ${String(item.source.filename).slice(0, 40)} · ${item.variants.length} variant${item.variants.length === 1 ? '' : 's'}`,
+      `mt-catalog-movie:${item.source.id}`
+    )
+  ]);
+
+  await ctx.reply(
+    `🎬 Processed Movies\n\nSources: ${movies.length}\nShowing: ${shown.length}\n\nOpen a movie to reuse its saved analysis and create/reopen variants.`,
+    Markup.inlineKeyboard(rows)
+  );
+}
+
+mirrorBot.command('movies', showProcessedMovies);
+
+mirrorBot.action(
+  /^mt-catalog-movie:(.+)$/,
+  async ctx => {
+    if (!isCatalogOwner(ctx.from.id)) {
+      await ctx.answerCbQuery('Owner only.').catch(() => {});
+      return;
+    }
+
+    const all = await catalogStore.listProcessedMovies(ctx.from.id);
+    const record = all.find(
+      item => item.source.id === ctx.match[1]
+    );
+
+    if (!record) {
+      await ctx.answerCbQuery(
+        'This saved movie is unavailable.'
+      ).catch(() => {});
+      return;
+    }
+
+    await ctx.answerCbQuery('Opening saved movie...').catch(() => {});
+
+    const session = newSession(ctx, {
+      kind: 'catalog-source',
+      catalogSourceId: record.source.id
+    });
+
+    session.workDir = workDir(session);
+    await fsp.mkdir(session.workDir, { recursive: true });
+
+    let media = record.metadata?.media || null;
+
+    if (!media) {
+      await setStatus(
+        session,
+        `🔎 Analyzing Saved MKV\n\n${record.source.filename}\n\nNo cached analysis found. Running ffprobe once...`
+      );
+
+      media = await probeMedia(record.source.path);
+
+      await catalogStore.saveMediaMetadata({
+        sourceId: record.source.id,
+        media,
+        ownerId: session.userId
+      });
+    } else {
+      await setStatus(
+        session,
+        `♻️ Saved Analysis Loaded\n\n${record.source.filename}\n\nNo ffprobe needed.`
+      );
+    }
+
+    await presentMediaSelection(
+      session,
+      record.source.path,
+      record.source.filename,
+      media
+    );
+  }
+);
+
 async function showAvailableTorrents(ctx) {
   if (!isCatalogOwner(ctx.from.id)) {
     await ctx.reply('This menu is owner-only.');
@@ -1337,6 +1563,7 @@ mirrorBot.action(/^mt-tfile:(\d+):(\d+)$/, async ctx => {
     if (savedSource) {
       await ctx.answerCbQuery('Using saved movie source.').catch(() => {});
       resetSessionAbort(s);
+      s.catalogSourceId = savedSource.id;
 
       jobManager.update(s.id, {
         state: 'running',
@@ -1452,10 +1679,30 @@ mirrorBot.action(/^mt-ready-download:(\d+)$/, async ctx => {
 });
 
 mirrorBot.action(/^mt-ready-delete:(\d+)$/, async ctx => {
-  await ctx.answerCbQuery('Deleting...').catch(() => {});
   const s = getSession(ctx.match[1], ctx.from.id);
-  if (!s) return;
-  await cleanup(s, { finalText: '🗑 Deleted' });
+
+  if (!s) {
+    await ctx.answerCbQuery(
+      'This job is no longer active.'
+    ).catch(() => {});
+    return;
+  }
+
+  await ctx.answerCbQuery(
+    'Deleting prepared variant...'
+  ).catch(() => {});
+
+  if (isCatalogOwner(s.userId) && s.catalogVariantId) {
+    await catalogStore.deleteVariant(
+      s.catalogVariantId,
+      s.userId
+    );
+  }
+
+  await cleanup(
+    s,
+    { finalText: '🗑 Prepared variant deleted' }
+  );
 });
 
 mirrorBot.action(/^mt-retry-upload:(\d+)$/, async ctx => {
@@ -1515,6 +1762,7 @@ export async function registerMirrorBotCommands() {
     { command: 'start', description: 'Open CRZ Bot' },
     { command: 'help', description: 'Show supported inputs' },
     { command: 'torrents', description: 'Open saved torrent catalog' },
+    { command: 'movies', description: 'Open processed movie catalog' },
     { command: 'cancel', description: 'Cancel current job' }
   ]);
 }
