@@ -391,3 +391,146 @@ test(
     await Promise.all([p1, p2]);
   }
 );
+
+
+test(
+  'processing queue never exceeds concurrency 2',
+  async () => {
+    const queues = new QueueManager({ processing: 2 });
+    const jobs = new JobManager({ queues });
+    let active = 0;
+    let maximum = 0;
+    const promises = [];
+
+    for (let i = 0; i < 5; i++) {
+      const job = jobs.create({
+        id: `process-${i}`,
+        type: 'processing',
+        userId: '1',
+        chatId: 1
+      });
+
+      promises.push(
+        jobs.enqueue(job.id, 'processing', async () => {
+          active++;
+          maximum = Math.max(maximum, active);
+          await sleep(40);
+          active--;
+          return i;
+        })
+      );
+    }
+
+    await Promise.all(promises);
+    assert.equal(maximum, 2);
+  }
+);
+
+test(
+  'upload queue never exceeds concurrency 2',
+  async () => {
+    const queues = new QueueManager({ upload: 2 });
+    const jobs = new JobManager({ queues });
+    let active = 0;
+    let maximum = 0;
+    const promises = [];
+
+    for (let i = 0; i < 5; i++) {
+      const job = jobs.create({
+        id: `upload-${i}`,
+        type: 'upload',
+        userId: '1',
+        chatId: 1
+      });
+
+      promises.push(
+        jobs.enqueue(job.id, 'upload', async () => {
+          active++;
+          maximum = Math.max(maximum, active);
+          await sleep(40);
+          active--;
+          return i;
+        })
+      );
+    }
+
+    await Promise.all(promises);
+    assert.equal(maximum, 2);
+  }
+);
+
+test(
+  'processing and upload queues do not block each other',
+  async () => {
+    const queues = new QueueManager({ processing: 1, upload: 1 });
+    const jobs = new JobManager({ queues });
+
+    const processing = jobs.create({
+      id: 'processing-independent',
+      type: 'processing',
+      userId: '1',
+      chatId: 1
+    });
+
+    const upload = jobs.create({
+      id: 'upload-independent',
+      type: 'upload',
+      userId: '1',
+      chatId: 1
+    });
+
+    let uploadStarted = false;
+
+    const p1 = jobs.enqueue(
+      processing.id,
+      'processing',
+      async () => {
+        await sleep(80);
+        return 'processing';
+      }
+    );
+
+    const p2 = jobs.enqueue(
+      upload.id,
+      'upload',
+      async () => {
+        uploadStarted = true;
+        await sleep(10);
+        return 'upload';
+      }
+    );
+
+    await sleep(20);
+    assert.equal(uploadStarted, true);
+    await Promise.all([p1, p2]);
+  }
+);
+
+test(
+  'finalizing state is not automatically converted to completed',
+  async () => {
+    const queues = new QueueManager({ upload: 1 });
+    const jobs = new JobManager({ queues });
+
+    const job = jobs.create({
+      id: 'finalizing-upload',
+      type: 'upload',
+      userId: '1',
+      chatId: 1
+    });
+
+    await jobs.enqueue(
+      job.id,
+      'upload',
+      async () => {
+        jobs.markFinalizing(job.id);
+        return 'transport-finished';
+      }
+    );
+
+    assert.equal(jobs.get(job.id).state, 'finalizing');
+
+    jobs.markCompleted(job.id, { confirmed: true });
+    assert.equal(jobs.get(job.id).state, 'completed');
+  }
+);

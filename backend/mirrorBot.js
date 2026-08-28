@@ -500,11 +500,29 @@ async function showPreparedChoices(session) {
 
 async function uploadReadyFile(session) {
   try {
-    if (!session.readyFilePath) throw new Error('Prepared file is no longer available');
+    if (!session.readyFilePath) {
+      throw new Error('Prepared file is no longer available');
+    }
+
     await ensureDrive(session.userId);
-    await uploadPrepared(session, session.readyFilePath, session.readyFilename, session.readyMimeType || 'video/x-matroska');
+
+    const result = await uploadPrepared(
+      session,
+      session.readyFilePath,
+      session.readyFilename,
+      session.readyMimeType || 'video/x-matroska'
+    );
+
+    // Only reach here after EZ returned final success.
+    jobManager.markCompleted(session.id, {
+      stage: 'upload',
+      confirmed: true,
+      result: result || null
+    });
+
     await cleanup(session, {
-      finalText: `✅ Uploaded to Google Drive\n\n${session.readyFilename}\nSize: ${humanBytes(session.readySize)}\nDrive: uploaded`
+      finalText:
+        `✅ Uploaded to Google Drive\n\n${session.readyFilename}\nSize: ${humanBytes(session.readySize)}\nDrive: confirmed`
     });
   } catch (error) {
     if (error?.name === 'AbortError') return;
@@ -538,32 +556,82 @@ async function downloadReadyFile(session) {
 
 async function uploadPrepared(session, filePath, filename, mimeType = 'video/x-matroska') {
   const stat = await fsp.stat(filePath);
+  session.uploadFinalizingShown = false;
 
-  await setStatus(session,
-    `☁️ Uploading to Google Drive\n\n${filename}\n\nProgress: 0%\nSent: 0 B / ${humanBytes(stat.size)}\nSpeed: calculating...\nETA: calculating...\n\nRoute: CRZ → EZ → Google Drive`
-  );
-
-  return uploadFileViaEz({
-    telegramId: session.userId,
-    filePath,
-    filename,
-    mimeType,
-    signal: session.abort.signal,
-    onProgress: p => {
-      void setStatus(session,
-        `☁️ Uploading to Google Drive\n\n${filename}\n\nProgress: ${p.percent}%\nSent: ${humanBytes(p.sentBytes)} / ${humanBytes(p.totalBytes)}\nSpeed: ${humanBytes(p.speed)}/s\nElapsed: ${humanDuration(p.elapsedSeconds)}\nETA: ${humanDuration(p.etaSeconds)}\n\nRoute: CRZ → EZ → Google Drive`
+  return enqueueSessionStage(
+    session,
+    'upload',
+    async ({ signal }) => {
+      await setStatus(
+        session,
+        `☁️ Uploading to Google Drive\n\n${filename}\n\nProgress: 0%\nSent: 0 B / ${humanBytes(stat.size)}\nSpeed: calculating...\nETA: calculating...\n\nRoute: CRZ → EZ → Google Drive`
       );
+
+      const result = await uploadFileViaEz({
+        telegramId: session.userId,
+        filePath,
+        filename,
+        mimeType,
+        signal,
+        onProgress: p => {
+          if (p.percent >= 100 || p.sentBytes >= p.totalBytes) {
+            if (!session.uploadFinalizingShown) {
+              session.uploadFinalizingShown = true;
+              jobManager.markFinalizing(session.id);
+
+              void setStatus(
+                session,
+                `☁️ Uploading to Google Drive\n\n${filename}\n\nProgress: 100%\nSent: ${humanBytes(p.sentBytes)} / ${humanBytes(p.totalBytes)}\n\n⏳ Finalizing with Google Drive...\nWaiting for EZ/Google confirmation.\n\nRoute: CRZ → EZ → Google Drive`,
+                cancelKeyboard(session.id)
+              );
+            }
+            return;
+          }
+
+          void setStatus(
+            session,
+            `☁️ Uploading to Google Drive\n\n${filename}\n\nProgress: ${p.percent}%\nSent: ${humanBytes(p.sentBytes)} / ${humanBytes(p.totalBytes)}\nSpeed: ${humanBytes(p.speed)}/s\nElapsed: ${humanDuration(p.elapsedSeconds)}\nETA: ${humanDuration(p.etaSeconds)}\n\nRoute: CRZ → EZ → Google Drive`
+          );
+        }
+      });
+
+      return result;
+    },
+    {
+      queuedDetail: `${filename}\n${humanBytes(stat.size)}`,
+      startingDetail: filename
     }
-  });
+  );
 }
 
 async function processDownloadedFile(session, filePath, filename) {
   const ext = path.extname(filename).toLowerCase();
 
   if (ext !== '.mkv') {
-    await setStatus(session, `✅ Download Complete\n\n${filename}\n\nNot an MKV. Uploading original file to Drive...`);
-    await uploadPrepared(session, filePath, filename, 'application/octet-stream');
-    await setStatus(session, `✅ Complete\n\n${filename}\n\nUploaded to Google Drive.`, Markup.inlineKeyboard([]));
+    await setStatus(
+      session,
+      `✅ Download Complete\n\n${filename}\n\nNot an MKV. Uploading original file to Drive...`
+    );
+
+    const result = await uploadPrepared(
+      session,
+      filePath,
+      filename,
+      'application/octet-stream'
+    );
+
+    jobManager.markCompleted(session.id, {
+      stage: 'upload',
+      confirmed: true,
+      result: result || null
+    });
+
+    await setStatus(
+      session,
+      `✅ Complete\n\n${filename}\n\nUploaded to Google Drive.\nFinal confirmation received.`,
+      Markup.inlineKeyboard([])
+    );
+
     return cleanup(session);
   }
 
@@ -641,46 +709,97 @@ async function askSubtitle(session) {
 }
 
 async function runMediaPrep(session) {
-  const base = path.basename(session.filename, path.extname(session.filename));
+  const base = path.basename(
+    session.filename,
+    path.extname(session.filename)
+  );
   const lang = session.selectedAudio.language || 'Audio';
-  const outputPath = path.join(session.workDir, `${base} [${lang}].mkv`);
-  const started = Date.now();
+  const outputPath = path.join(
+    session.workDir,
+    `${base} [${lang}].mkv`
+  );
 
   try {
     const inputStat = await fsp.stat(session.inputPath);
-    await ensureServerSpace(inputStat.size, 1.15, session.workDir || os.tmpdir());
+    await ensureServerSpace(
+      inputStat.size,
+      1.15,
+      session.workDir || os.tmpdir()
+    );
   } catch (error) {
-    return showRecoverableError(session, error, 'process');
+    return showRecoverableError(
+      session,
+      error,
+      'process'
+    );
   }
 
-  await setStatus(session,
-    `🔧 Preparing MKV\n\nAudio: ${lang}\n${session.selectedAudio.codec.toUpperCase()} → ${session.selectedAudio.supported ? 'COPY' : String(process.env.MIRROR_AUDIO_TARGET || 'AAC').toUpperCase()}\nVideo: COPY\n\nProgress: starting...`
-  );
+  try {
+    const result = await enqueueSessionStage(
+      session,
+      'processing',
+      async ({ signal }) => {
+        const started = Date.now();
 
-  const result = await prepareMkv({
-    inputPath: session.inputPath,
-    outputPath,
-    audioStream: session.selectedAudio,
-    englishSubtitle: session.media.englishSubtitle,
-    keepEnglishSubtitle: session.keepEnglishSubtitle,
-    durationSeconds: session.media.durationSeconds,
-    signal: session.abort.signal,
-    onProgress: p => {
-      const elapsed = (Date.now() - started) / 1000;
-      void setStatus(session,
-        `🔧 Preparing MKV\n\nAudio: ${lang}\n${p.inputCodec.toUpperCase()} → ${p.converting ? p.outputCodec.toUpperCase() : 'COPY'}\nVideo: COPY\n\nProgress: ${p.percent ?? '?'}%\nSpeed: ${p.speed ? `${p.speed.toFixed(2)}x` : 'calculating...'}\nProcessed: ${humanDuration(p.processedSeconds)} / ${humanDuration(session.media.durationSeconds)}\nElapsed: ${humanDuration(elapsed)}\nETA: ${humanDuration(p.etaSeconds)}`
-      );
-    }
-  });
+        await setStatus(
+          session,
+          `🔧 Preparing MKV\n\nAudio: ${lang}\n${session.selectedAudio.codec.toUpperCase()} → ${session.selectedAudio.supported ? 'COPY' : String(process.env.MIRROR_AUDIO_TARGET || 'AAC').toUpperCase()}\nVideo: COPY\n\nProgress: starting...`
+        );
 
-  const finalName = path.basename(result.outputPath);
-  session.readyFilePath = result.outputPath;
-  session.readyFilename = finalName;
-  session.readyMimeType = 'video/x-matroska';
-  session.readySize = result.size;
-  session.readyOutputCodec = result.outputCodec;
+        return prepareMkv({
+          inputPath: session.inputPath,
+          outputPath,
+          audioStream: session.selectedAudio,
+          englishSubtitle: session.media.englishSubtitle,
+          keepEnglishSubtitle: session.keepEnglishSubtitle,
+          durationSeconds: session.media.durationSeconds,
+          signal,
+          onProgress: p => {
+            const elapsed =
+              (Date.now() - started) / 1000;
 
-  await showPreparedChoices(session);
+            void setStatus(
+              session,
+              `🔧 Preparing MKV\n\nAudio: ${lang}\n${p.inputCodec.toUpperCase()} → ${p.converting ? p.outputCodec.toUpperCase() : 'COPY'}\nVideo: COPY\n\nProgress: ${p.percent ?? '?'}%\nSpeed: ${p.speed ? `${p.speed.toFixed(2)}x` : 'calculating...'}\nProcessed: ${humanDuration(p.processedSeconds)} / ${humanDuration(session.media.durationSeconds)}\nElapsed: ${humanDuration(elapsed)}\nETA: ${humanDuration(p.etaSeconds)}`
+            );
+          }
+        });
+      },
+      {
+        queuedDetail:
+          `${session.filename}\nAudio: ${lang}`,
+        startingDetail:
+          `${session.filename}\nAudio: ${lang}`
+      }
+    );
+
+    const finalName = path.basename(result.outputPath);
+
+    session.readyFilePath = result.outputPath;
+    session.readyFilename = finalName;
+    session.readyMimeType = 'video/x-matroska';
+    session.readySize = result.size;
+    session.readyOutputCodec = result.outputCodec;
+
+    jobManager.markWaitingUser(session.id, {
+      processingComplete: true,
+      readyFilePath: session.readyFilePath,
+      readyFilename: session.readyFilename
+    });
+
+    jobManager.update(session.id, {
+      stage: 'prepared'
+    });
+
+    await showPreparedChoices(session);
+  } catch (error) {
+    if (error?.name === 'AbortError') return;
+    await showRecoverableError(
+      session,
+      error,
+      'process'
+    );
+  }
 }
 
 async function runTorrentPreflightQueued(session) {
@@ -1136,9 +1255,19 @@ mirrorBot.action(/^mt-sub:(\d+):(yes|no)$/, async ctx => {
 });
 
 mirrorBot.action(/^mt-ready-upload:(\d+)$/, async ctx => {
-  await ctx.answerCbQuery('Starting Drive upload...').catch(() => {});
   const s = getSession(ctx.match[1], ctx.from.id);
-  if (!s) return;
+
+  if (!s) {
+    await ctx.answerCbQuery('This job is no longer active.').catch(() => {});
+    return;
+  }
+
+  if (s.activePromise) {
+    await ctx.answerCbQuery('This job is already active.').catch(() => {});
+    return;
+  }
+
+  await ctx.answerCbQuery('Drive upload queued.').catch(() => {});
   resetSessionAbort(s);
   await uploadReadyFile(s);
 });
@@ -1159,24 +1288,39 @@ mirrorBot.action(/^mt-ready-delete:(\d+)$/, async ctx => {
 });
 
 mirrorBot.action(/^mt-retry-upload:(\d+)$/, async ctx => {
-  await ctx.answerCbQuery('Retrying upload...').catch(() => {});
   const s = getSession(ctx.match[1], ctx.from.id);
-  if (!s) return;
+
+  if (!s) {
+    await ctx.answerCbQuery('This job is no longer active.').catch(() => {});
+    return;
+  }
+
+  if (s.activePromise) {
+    await ctx.answerCbQuery('This job is already active.').catch(() => {});
+    return;
+  }
+
+  await ctx.answerCbQuery('Retry upload queued.').catch(() => {});
   resetSessionAbort(s);
   await uploadReadyFile(s);
 });
 
 mirrorBot.action(/^mt-retry-process:(\d+)$/, async ctx => {
-  await ctx.answerCbQuery('Retrying processing...').catch(() => {});
   const s = getSession(ctx.match[1], ctx.from.id);
-  if (!s) return;
-  resetSessionAbort(s);
-  try {
-    await runMediaPrep(s);
-  } catch (error) {
-    if (error?.name === 'AbortError') return;
-    await showRecoverableError(s, error, 'process');
+
+  if (!s) {
+    await ctx.answerCbQuery('This job is no longer active.').catch(() => {});
+    return;
   }
+
+  if (s.activePromise) {
+    await ctx.answerCbQuery('This job is already active.').catch(() => {});
+    return;
+  }
+
+  await ctx.answerCbQuery('Retry processing queued.').catch(() => {});
+  resetSessionAbort(s);
+  await runMediaPrep(s);
 });
 
 mirrorBot.action(/^mt-retry-copy:(\d+)$/, async ctx => {
