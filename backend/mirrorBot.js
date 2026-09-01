@@ -99,6 +99,15 @@ function resetSessionAbort(session) {
   return controller;
 }
 
+function runDetached(label, task) {
+  Promise.resolve()
+    .then(task)
+    .catch(error => {
+      if (error?.name === 'AbortError') return;
+      console.error(`[detached:${label}]`, error);
+    });
+}
+
 function queueDisplayName(queueName) {
   if (queueName === 'preflight') return 'Torrent preflight';
   if (queueName === 'download') return 'Movie download';
@@ -223,14 +232,103 @@ function cancelKeyboard(id) {
   return Markup.inlineKeyboard([[Markup.button.callback('🛑 Cancel', `mt-cancel:${id}`)]]);
 }
 
+function inferStatusStage(text) {
+  const value = String(text || '').toLowerCase();
+
+  if (value.includes('cleaning temporary')) return 'cleanup';
+  if (value.includes('finalizing')) return 'finalizing';
+
+  if (
+    value.includes('successfully uploaded') ||
+    value.includes('upload completed') ||
+    value.includes('google confirmation') ||
+    value.includes('completed')
+  ) return 'completed';
+
+  if (
+    value.includes('mkv prepared') ||
+    value.includes('prepared file') ||
+    value.startsWith('✅ mkv prepared')
+  ) return 'prepared';
+
+  if (
+    value.includes('google drive upload') ||
+    value.includes('uploading to google drive') ||
+    value.includes('upload queued') ||
+    value.includes('retry upload')
+  ) return 'upload';
+
+  if (
+    value.includes('preparing mkv') ||
+    value.includes('mkv processing') ||
+    value.includes('processing queued') ||
+    value.includes('processing starting') ||
+    value.includes('retry processing')
+  ) return 'processing';
+
+  if (
+    value.includes('analyzing') ||
+    value.includes('ffprobe') ||
+    value.includes('saved analysis')
+  ) return 'analysis';
+
+  if (
+    value.includes('movie download') ||
+    value.includes('downloading') ||
+    value.includes('download queued') ||
+    value.includes('download starting') ||
+    value.includes('reusing saved source')
+  ) return 'download';
+
+  if (
+    value.includes('torrent preflight') ||
+    value.includes('checking torrent') ||
+    value.includes('torrent health')
+  ) return 'preflight';
+
+  if (
+    value.includes('choose ') ||
+    value.includes('select ') ||
+    value.includes('audio track') ||
+    value.includes('subtitle')
+  ) return 'selection';
+
+  if (
+    value.includes('cancelling') ||
+    value.startsWith('🛑 cancelled')
+  ) return 'cancel';
+
+  if (
+    value.startsWith('❌') ||
+    value.includes('failed') ||
+    value.includes('error')
+  ) return 'error';
+
+  return 'general';
+}
+
 async function setStatus(session, text, keyboard = cancelKeyboard(session.id)) {
-  if (!session.statusMessageId) {
-    const sent = await mirrorBot.telegram.sendMessage(session.chatId, text, keyboard);
+  const stage = inferStatusStage(text);
+  const sameStage =
+    session.statusMessageId &&
+    session.statusStage === stage;
+
+  session.lastStatusText = text;
+
+  // A stage transition gets its own Telegram message.
+  // Progress updates inside the same stage edit only that stage's message.
+  if (!sameStage) {
+    const sent = await mirrorBot.telegram.sendMessage(
+      session.chatId,
+      text,
+      keyboard
+    );
+
     session.statusMessageId = sent.message_id;
-    session.lastStatusText = text;
+    session.statusStage = stage;
     return;
   }
-  session.lastStatusText = text;
+
   await mirrorBot.telegram.editMessageText(
     session.chatId,
     session.statusMessageId,
@@ -1368,26 +1466,97 @@ mirrorBot.on('text', async (ctx, next) => {
 
   if (!text) return;
 
-  try {
-    if (text.startsWith('magnet:?')) {
-      return await beginTorrentPreflight(ctx, { kind: 'magnet', value: text });
-    }
-    if (/^https?:\/\//i.test(text)) {
-      return await handleUrl(ctx, text);
-    }
-    await ctx.reply('Send a magnet link, HTTP/HTTPS mirror/direct link, MKV, or .torrent file.');
-  } catch (error) {
-    await ctx.reply(`❌ ${error.message}`);
+  if (text.startsWith('magnet:?')) {
+    runDetached('magnet-preflight', async () => {
+      try {
+        await beginTorrentPreflight(
+          ctx,
+          { kind: 'magnet', value: text }
+        );
+      } catch (error) {
+        await ctx.reply(`❌ ${error.message}`).catch(() => {});
+      }
+    });
+    return;
   }
+
+  if (/^https?:\/\//i.test(text)) {
+    runDetached('direct-url', async () => {
+      try {
+        await handleUrl(ctx, text);
+      } catch (error) {
+        await ctx.reply(`❌ ${error.message}`).catch(() => {});
+      }
+    });
+    return;
+  }
+
+  await ctx.reply(
+    'Send a magnet link, HTTP/HTTPS mirror/direct link, MKV, or .torrent file.'
+  );
 });
 
-mirrorBot.on('document', async ctx => {
-  try {
-    await handleTelegramDocument(ctx, ctx.message.document);
-  } catch (error) {
-    const info = friendlyError(error);
-    await ctx.reply(`❌ ${info.title}\n\n${info.text}`);
+mirrorBot.on('document', ctx => {
+  runDetached('telegram-document', async () => {
+    try {
+      await handleTelegramDocument(
+        ctx,
+        ctx.message.document
+      );
+    } catch (error) {
+      const info = friendlyError(error);
+      await ctx.reply(
+        `❌ ${info.title}\n\n${info.text}`
+      ).catch(() => {});
+    }
+  });
+});
+
+function filenameFromTelegramVideo(message, video) {
+  if (video?.file_name) return String(video.file_name);
+
+  const caption = String(message?.caption || '');
+  const match = caption.match(/([^\n\r]+?\.mkv)\b/i);
+
+  if (match?.[1]) {
+    return match[1].replace(/^[\s:>*\-]+/, '').trim();
   }
+
+  const mime = String(video?.mime_type || '').toLowerCase();
+  if (mime.includes('matroska') || mime.includes('x-matroska')) {
+    return `telegram-video-${video.file_unique_id || Date.now()}.mkv`;
+  }
+
+  return null;
+}
+
+mirrorBot.on('video', ctx => {
+  runDetached('telegram-video', async () => {
+    try {
+      const video = ctx.message.video;
+      const filename = filenameFromTelegramVideo(ctx.message, video);
+
+      if (!filename) {
+        await ctx.reply(
+          'This Telegram video is not identified as an MKV. Send the original MKV as a file/document.'
+        ).catch(() => {});
+        return;
+      }
+
+      await handleTelegramDocument(ctx, {
+        file_id: video.file_id,
+        file_unique_id: video.file_unique_id,
+        file_name: filename,
+        file_size: video.file_size || null,
+        mime_type: video.mime_type || 'video/x-matroska'
+      });
+    } catch (error) {
+      const info = friendlyError(error);
+      await ctx.reply(
+        `❌ ${info.title}\n\n${info.text}`
+      ).catch(() => {});
+    }
+  });
 });
 
 mirrorBot.action(/^mt-cancel:(\d+)$/, async ctx => {
@@ -1645,12 +1814,14 @@ mirrorBot.action(/^mt-tfile:(\d+):(\d+)$/, async ctx => {
 
   await ctx.answerCbQuery('Movie added to download queue.').catch(() => {});
 
-  try {
-    await runTorrentDownload(s, fileIndex);
-  } catch (error) {
-    if (error?.name === 'AbortError') return;
-    await showRecoverableError(s, error, 'torrent');
-  }
+  runDetached(`torrent-download:${s.id}`, async () => {
+    try {
+      await runTorrentDownload(s, fileIndex);
+    } catch (error) {
+      if (error?.name === 'AbortError') return;
+      await showRecoverableError(s, error, 'torrent');
+    }
+  });
 });
 
 mirrorBot.action(/^mt-source:(\d+):(\d+)$/, async ctx => {
@@ -1688,12 +1859,14 @@ mirrorBot.action(/^mt-sub:(\d+):(yes|no)$/, async ctx => {
   if (!s) return;
   s.keepEnglishSubtitle = ctx.match[2] === 'yes';
 
-  try {
-    await runMediaPrep(s);
-  } catch (error) {
-    if (error?.name === 'AbortError') return;
-    await showRecoverableError(s, error, 'process');
-  }
+  runDetached(`media-prep:${s.id}`, async () => {
+    try {
+      await runMediaPrep(s);
+    } catch (error) {
+      if (error?.name === 'AbortError') return;
+      await showRecoverableError(s, error, 'process');
+    }
+  });
 });
 
 mirrorBot.action(/^mt-ready-upload:(\d+)$/, async ctx => {
@@ -1711,7 +1884,10 @@ mirrorBot.action(/^mt-ready-upload:(\d+)$/, async ctx => {
 
   await ctx.answerCbQuery('Drive upload queued.').catch(() => {});
   resetSessionAbort(s);
-  await uploadReadyFile(s);
+  runDetached(
+    `drive-upload:${s.id}`,
+    () => uploadReadyFile(s)
+  );
 });
 
 mirrorBot.action(/^mt-ready-download:(\d+)$/, async ctx => {
@@ -1719,7 +1895,10 @@ mirrorBot.action(/^mt-ready-download:(\d+)$/, async ctx => {
   const s = getSession(ctx.match[1], ctx.from.id);
   if (!s) return;
   resetSessionAbort(s);
-  await downloadReadyFile(s);
+  runDetached(
+    `telegram-download:${s.id}`,
+    () => downloadReadyFile(s)
+  );
 });
 
 mirrorBot.action(/^mt-ready-delete:(\d+)$/, async ctx => {
@@ -1764,7 +1943,10 @@ mirrorBot.action(/^mt-retry-upload:(\d+)$/, async ctx => {
 
   await ctx.answerCbQuery('Retry upload queued.').catch(() => {});
   resetSessionAbort(s);
-  await uploadReadyFile(s);
+  runDetached(
+    `retry-upload:${s.id}`,
+    () => uploadReadyFile(s)
+  );
 });
 
 mirrorBot.action(/^mt-retry-process:(\d+)$/, async ctx => {
@@ -1782,7 +1964,10 @@ mirrorBot.action(/^mt-retry-process:(\d+)$/, async ctx => {
 
   await ctx.answerCbQuery('Retry processing queued.').catch(() => {});
   resetSessionAbort(s);
-  await runMediaPrep(s);
+  runDetached(
+    `retry-processing:${s.id}`,
+    () => runMediaPrep(s)
+  );
 });
 
 mirrorBot.action(/^mt-retry-copy:(\d+)$/, async ctx => {
@@ -1790,7 +1975,10 @@ mirrorBot.action(/^mt-retry-copy:(\d+)$/, async ctx => {
   const s = getSession(ctx.match[1], ctx.from.id);
   if (!s) return;
   resetSessionAbort(s);
-  await runTelegramMkvCopy(s);
+  runDetached(
+    `retry-copy:${s.id}`,
+    () => runTelegramMkvCopy(s)
+  );
 });
 
 mirrorBot.action(/^mt-retry-torrent:(\d+)$/, async ctx => {
